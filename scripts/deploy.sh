@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# scripts/deploy.sh <kern checkout> <kern-kernels index> <out>: the manifests of a full-K3 P/D
+# scripts/deploy.sh <kern checkout> <kernel index> <out>: the manifests of a full-K3 P/D
 # deployment, each verified by the checkout's kern.
 #   <out>/p/stage{0..7}.json  P: the packed 93-layer prefill (16 sequences a chunk of 8192 rows,
 #                             262144 context) cut into PP8 stages every 12 layers
 #   <out>/d.json              D: the 93-layer TP8 / EP8 / DCP8 decode step (64 sequences,
 #                             327680 context)
-# The kern checkout is the commit step/Cargo.toml pins, built (`cargo build --release`).
+# The kern checkout is the commit step/Cargo.toml pins, built (`cargo build --release`); the kernel
+# index is kern master's kernel_index/.
 set -euo pipefail
 kern=$(realpath "$1") index=$(realpath "$2") out=$(realpath -m "$3")
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

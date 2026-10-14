@@ -6,7 +6,7 @@ A fork of kern's tools/gen_k3.py; the rest of kern's tools (the manifest
 helpers, `once`, the kernel index, the FMHA and batched-GEMM ABI ports) are
 imported from the kern checkout KERN names:
 
-    KERN=<kern checkout> KERN_INDEX_DIR=<kern-kernels>/index \
+    KERN=<kern checkout> KERN_INDEX_DIR=<kern master>/kernel_index \
       python3 scripts/gen_stage.py --chunk 8192 --experts 896 --max-ctx 262144 > p.json
     ... --tp 8 --experts 896 --max-ctx 327680 --moe-variants FC1,FC2 --peer-ar > d.json
 

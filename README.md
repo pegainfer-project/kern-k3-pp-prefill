@@ -39,12 +39,12 @@ Everything is pinned to kern
 2. **Manifests.**
 
    ```sh
-   scripts/deploy.sh <kern checkout> <kern-kernels>/index <out>
+   scripts/deploy.sh <kern checkout> <kern master>/kernel_index <out>
    ```
 
    writes `<out>/p/stage0..7.json` and `<out>/d.json`, each verified by
    `kern`. The generator reads modules this repository pins from
-   `kernels.toml`, everything else from the kern-kernels index.
+   `kernels.toml`, everything else from kern's kernel index (`kernel_index/`).
 3. **Kernels.** CUDA 13.0 nvcc (V13.0.88) reproduces the pinned cubins:
 
    ```sh
@@ -235,5 +235,5 @@ since is this repository's history.
 kern's sources keep their [Apache-2.0 license](source/LICENSE), FlashKDA
 its [MIT license](source/flash-kda/LICENSE), FlashInfer its
 [Apache-2.0 license](source/flashinfer-moe-routing/LICENSE). The cubins not
-in the kern-kernels index are all built from this repository by
+in kern's kernel index are all built from this repository by
 `scripts/build.py`.

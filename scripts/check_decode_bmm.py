@@ -15,7 +15,7 @@ which is not an ABI difference. Pointers are checked for consistency: every
 field naming one interface param holds one address, and FC2 reads what FC1
 of the same layer wrote, over the same routing tables.
 
-    KERN=<kern checkout> KERN_INDEX_DIR=<kern-kernels>/index \
+    KERN=<kern checkout> KERN_INDEX_DIR=<kern master>/kernel_index \
       python3 scripts/check_decode_bmm.py [graphs dir]
 """
 import functools
