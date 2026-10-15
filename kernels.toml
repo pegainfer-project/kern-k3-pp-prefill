@@ -12,6 +12,13 @@ upstream = "flashinfer-cubin 0.6.18, cubins/8ec29a98612c3670f9f28825d1ed19f09496
 sha256 = "9de645ab4053412ee0832c633510308f4cd3c3fa5d25812924d9a799689f5fc9"
 source = "source/copy_rows.cu"
 
+[kernels."cake_k3_mla_wide"]
+sha256 = "ea9833f6b3a5b12350fb0743efdf85aad30fa7cc853934864f712266ce75548a"
+prebuilt = "prebuilt/cake_k3_mla_wide.cubin"
+source = "source/flashinfer-cake-k3-mla/cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653_kernel.cu"
+build = "source/flashinfer-cake-k3-mla/build.sh"
+upstream = "FlashInfer 3637083a, csrc/cake_kimi_k3_mla (Cake-generated, Apache-2.0)"
+
 [kernels."flash_kda_d128_varlen"]
 sha256 = "751d1f12b73863328877fa69595a8ac4436b985905460f374ab34d6a672c5575"
 prebuilt = "prebuilt/flash_kda_d128_varlen.cubin"
@@ -33,6 +40,11 @@ defines = { HEADS = 12 }
 [kernels."k3_dcp"]
 sha256 = "db9b91b8e065c0f72494d74d60b0f21a68fe83f0cebe7333c3d5e777d7eccac1"
 source = "source/k3_dcp.cu"
+
+[kernels."k3_dcp+CAKE=1"]
+sha256 = "304e62dcc52171660b8fcaf17743021e6a89e84c9f059a14f1535d9ff5b0de3e"
+source = "source/k3_dcp.cu"
+defines = { CAKE = 1 }
 
 [kernels."k3_kda_core+HEADS=12"]
 sha256 = "42fc31d9c4300caaace896def74f0804bf527adc58aabaf70b96c2012f8620ca"
@@ -56,6 +68,11 @@ source = "source/k3_mla_prep.cu"
 sha256 = "8847e422800c072d15483389f867db81c0f91a44ecaa3c97066b24528b0e1b04"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, MLA_FUSED = 3648 }
+
+[kernels."k3_mla_prep+INNER=1536+KV_FP8=1+MLA_FUSED=3648"]
+sha256 = "02bd392e2c3974fd24c1e3faf53ef249317b00be1c383615cf8f47bff012ad57"
+source = "source/k3_mla_prep.cu"
+defines = { INNER = 1536, KV_FP8 = 1, MLA_FUSED = 3648 }
 
 [kernels."k3_mla_vup_gate+HEADS=12"]
 sha256 = "a6b673b9fa7595089c49b403cdf23c8d0224bab53b0b9224fc6392afe87c09c6"
@@ -114,6 +131,11 @@ defines = { NRANKS = 8 }
 [kernels."k3_mla_absorb_mma"]
 sha256 = "d32425ed89d772e25970c9a648873dca2a7060edb1ba1f3e6b508ddc581982b1"
 source = "source/k3_mla_absorb_mma.cu"
+
+[kernels."k3_mla_absorb_mma+Q_FP8=1"]
+sha256 = "fced1c2761d9d198a0c0266aebd031d8e1b9c706b0f212ef0ae5239e1c2f6bbb"
+source = "source/k3_mla_absorb_mma.cu"
+defines = { Q_FP8 = 1 }
 
 [kernels."k3_kda_core+KDA_CONV=1"]
 sha256 = "76e9843d8311c009a580e0f40abfe171ed64af946b90ed3a0da3b7e24eaaab91"

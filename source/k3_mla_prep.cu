@@ -14,7 +14,7 @@
 //       const bf16* gamma_q_a,     // [Q_LORA  = 1536]
 //       const bf16* gamma_kv_a,    // [KV_LORA = 512]
 //       const i64*  slot_mapping,  // [B]
-//       bf16*       slab,          // state base
+//       bf16*       slab,          // state base (e4m3 bytes under KV_FP8)
 //       long long layer_off, long long page_stride,   // elements
 //       bf16*       q_norm,        // [B, Q_LORA]
 //       bf16*       mla_gate,      // [B, INNER = 12288]
@@ -54,6 +54,10 @@
 // Generic path: plain strided float4 loops, with the head columns and the
 // gamma words staged through shared memory in the same pass so that the gamma
 // round trip is not stranded behind the block reduction.
+//
+// -DKV_FP8: the slab is SGLang's fp8 cache, one e4m3 byte an element: each
+// landed bf16 goes through f32 to e4m3 by cvt.rn without saturation, aten's
+// cast (overflow is NaN), so a row is the bytes SGLang's own decode writes.
 //
 // Slab addressing (elements, `slab` is the state base):
 //   row = (slot / 64) * page_stride + layer_off + (slot % 64) * 576
@@ -117,6 +121,20 @@ __device__ __forceinline__ unsigned mul2(unsigned a, unsigned g) {
                              *reinterpret_cast<const __nv_bfloat162*>(&g));
   return *reinterpret_cast<unsigned*>(&r);
 }
+#ifdef KV_FP8
+#include <cuda_fp8.h>
+typedef unsigned char kv_t;
+__device__ __forceinline__ unsigned fp8x2(unsigned w) {
+  return __nv_cvt_float2_to_fp8x2(__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w)), __NV_NOSAT, __NV_E4M3);
+}
+__device__ __forceinline__ void put4(kv_t* p, uint2 v) {
+  *reinterpret_cast<unsigned*>(p) = fp8x2(v.x) | fp8x2(v.y) << 16;
+}
+#define PUT4(p, v) put4(p, v)
+#else
+typedef __nv_bfloat16 kv_t;
+#define PUT4(p, v) (*reinterpret_cast<uint2*>(p) = (v))
+#endif
 __device__ __forceinline__ float landf(float x) {
   return __bfloat162float(__float2bfloat16(x));
 }
@@ -126,7 +144,7 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
     const __nv_bfloat16* __restrict__ gamma_q_a,   // [Q_LORA]
     const __nv_bfloat16* __restrict__ gamma_kv_a,  // [KV_LORA]
     const long long* __restrict__ slot_mapping,    // [B]
-    __nv_bfloat16* __restrict__ slab,              // state base
+    kv_t* __restrict__ slab,                       // state base
     long long layer_off, long long page_stride,    // elements
     __nv_bfloat16* __restrict__ q_norm,            // [B, Q_LORA]
     __nv_bfloat16* __restrict__ mla_gate,          // [B, INNER]
@@ -177,7 +195,7 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
     // independent of the reduction, so issued before the barrier
     const long long slot = slot_mapping[b];
     const bool append = (slot >= 0);
-    __nv_bfloat16* const row = slab + (slot / 64) * page_stride + layer_off +
+    kv_t* const row = slab + (slot / 64) * page_stride + layer_off +
                                (slot % 64) * KV_A;
     const __nv_bfloat16* const gsrc =
         isq ? (gamma_q_a + col) : (gamma_kv_a + (col - Q_LORA));
@@ -206,9 +224,9 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
     if (isq) {
       *reinterpret_cast<uint2*>(q_norm + (long long)b * Q_LORA + col) = o;
       if (append && t < ROPE / 4)
-        *reinterpret_cast<uint2*>(row + KV_LORA + 4 * t) = rope4;
+        PUT4(row + KV_LORA + 4 * t, rope4);
     } else if (append) {
-      *reinterpret_cast<uint2*>(row + (col - Q_LORA)) = o;
+      PUT4(row + (col - Q_LORA), o);
     }
     return;
   }
@@ -219,7 +237,7 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
   if (blockIdx.y == 0) {
     const long long slot = slot_mapping[b];
     const bool append = (slot >= 0);
-    __nv_bfloat16* const row = slab + (slot / 64) * page_stride + layer_off +
+    kv_t* const row = slab + (slot / 64) * page_stride + layer_off +
                                (slot % 64) * KV_A;
     float sq = 0.f, sk = 0.f;
     // One pass over the 528 head units.  This unit's gamma word rides along
@@ -268,12 +286,10 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
         // no slot this step: the latent row is not touched
       } else if (u < KU) {
         const uint2 gk = gs[u];
-        *reinterpret_cast<uint2*>(row + 4 * (u - QU)) =
-            make_uint2(mul2(pack2(x.x * sck, x.y * sck), gk.x),
-                       mul2(pack2(x.z * sck, x.w * sck), gk.y));
+        PUT4(row + 4 * (u - QU), make_uint2(mul2(pack2(x.x * sck, x.y * sck), gk.x),
+                                            mul2(pack2(x.z * sck, x.w * sck), gk.y)));
       } else {
-        *reinterpret_cast<uint2*>(row + KV_LORA + 4 * (u - KU)) =
-            make_uint2(pack2(x.x, x.y), pack2(x.z, x.w));
+        PUT4(row + KV_LORA + 4 * (u - KU), make_uint2(pack2(x.x, x.y), pack2(x.z, x.w)));
       }
     }
     if (gridDim.y > 1) return;  // the gate belongs to the other blocks

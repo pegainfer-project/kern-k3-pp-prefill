@@ -5,7 +5,8 @@ model runner drives (kern's `python/kern_sglang`): `k3_hosted.py`'s program
 boundary, and every state a host state over the tensors SGLang allocates for
 a hybrid MLA + KDA model, one per layer and kind:
 
-- `mla.l<L>`: an MLA layer's latent, SGLang's `[rows, 1, 576]` bf16 read as
+- `mla.l<L>`: an MLA layer's latent, SGLang's `[rows, 1, 576]` bf16 (or the
+  uint8 its fp8 cache stores, a manifest made with `--kv fp8`) read as
   64-row pages, the view `k3_vllm.py` binds; no MLA kernel changes.
 - `ssm.l<L>`: a KDA layer's recurrent state, SGLang's `[slots, heads,
   128 v, 128 k]` f32: the base line's rec, byte for byte, at a stride of
@@ -33,7 +34,7 @@ import tomllib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from k3_hosted import hosted  # noqa: E402
-from k3_vllm import KERNEL_BLOCK, MLA_HOST, TOKEN_BYTES, check_mla  # noqa: E402
+from k3_vllm import KERNEL_BLOCK, ROW, TOKEN_BYTES, check_mla, mla_host  # noqa: E402
 
 PINNED = tomllib.loads((pathlib.Path(__file__).resolve().parents[1] / "kernels.toml").read_text())["kernels"]
 KD, TAPS, STREAMS = 128, 3, 3
@@ -56,8 +57,8 @@ def host_states(m: dict, h: int) -> dict:
     def hosts(name, s):
         l = layer(name)
         if name.startswith("kv."):
-            assert s["bytes_per_token"] == TOKEN_BYTES, f"`{name}` is {s['bytes_per_token']} B a token"
-            return {f"mla.l{l}": {"host": MLA_HOST}}
+            assert s["bytes_per_token"] in (TOKEN_BYTES, ROW), f"`{name}` is {s['bytes_per_token']} B a token"
+            return {f"mla.l{l}": {"host": mla_host(s["bytes_per_token"])}}
         return {f"ssm.l{l}": {"host": ssm}, f"conv.l{l}": {"host": conv}}
 
     return {k: v for n, s in m["states"].items() for k, v in hosts(n, s).items()}
@@ -120,8 +121,9 @@ def on_sglang(m: dict) -> dict:
     assert len(lines) == 1, f"KDA lines of {sorted(lines)} B"
     (line,) = lines
     h = heads(line)
+    (token,) = {s["bytes_per_token"] for s in m["states"].values() if "bytes_per_token" in s}
     for name in ("mla_prep", "mla_attn"):
-        check_mla(name, m["ops"][name])
+        check_mla(name, m["ops"][name], token)
     op, module = kda_core(m["ops"]["kda_core"], line, h, m["modules"])
     mla = next(f"mla.l{layer(n)}" for n in m["states"] if n.startswith("kv."))
     kda = next(layer(n) for n in m["states"] if n.startswith("kda."))

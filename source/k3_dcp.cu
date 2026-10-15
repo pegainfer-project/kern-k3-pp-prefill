@@ -90,6 +90,19 @@
 //   gated[b, j*128 + dv] = bf16(sum_c W_UV_j[dv, c] * o[c]) * bf16(sigmoid(gate)),
 //   the sum f32 over a warp's 32 lanes, 16 columns each.
 //
+//   -DCAKE: the partials are the Cake wide decode's (FlashInfer's Kimi-K3 MLA
+//   over the fp8 cache, source/flashinfer-cake-k3-mla), every row run as the
+//   same `split` splits, the first five parameters
+//       const bf16* part_o,     // [R][HEADS][split][LAT]  the splits' normalized o
+//       const float* part_max,  // [R][HEADS][split]       their max, log2 units
+//       const float* part_sum,  // [R][HEADS][split]       their sum below it
+//       const int* seq_lens, int split
+//   A split's log2-sum-exp is max + log2(sum), -inf for an empty split
+//   (max -inf, or sum 0), off the true one by a constant of the kernel, the
+//   same on every split and member, so the merges never see it. The splits
+//   merge as Cake's reduction does: m their largest, w = exp2(l_s - m),
+//   o = bf16(sum_s w o_s / sum_s w), lse = (m + log2(sum_s w)) / log2(e).
+//
 //   nvcc -cubin -arch=sm_103a source/k3_dcp.cu
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -194,6 +207,13 @@ __device__ __forceinline__ float lg2(float x) {
   return y;
 }
 
+#ifdef CAKE
+// A Cake split's log2-sum-exp from its (max, sum); an empty split (no tile of the row) is -inf.
+__device__ __forceinline__ float split_lse(float m, float sum) {
+  return m == -CUDART_INF_F || !(sum > 0.f) ? -CUDART_INF_F : m + lg2(sum);
+}
+#endif
+
 __device__ __forceinline__ uint4 ld_volatile(const uint4* p) {
   uint4 v;
   asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
@@ -268,8 +288,14 @@ __device__ __forceinline__ void await_all(uint4 (&v)[NRANKS], const uint4* p, lo
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+#ifdef CAKE
+    const bf16* __restrict__ part_o, const float* __restrict__ part_max, const float* __restrict__ part_sum,
+    const int* __restrict__ seq_lens, int split,
+#else
     const float* __restrict__ acc_o, const float* __restrict__ acc_lse, const int* __restrict__ seq_lens,
-    const int* __restrict__ bsk, int split_max, const bf16* __restrict__ w_kv_b,
+    const int* __restrict__ bsk, int split_max,
+#endif
+    const bf16* __restrict__ w_kv_b,
     const bf16* __restrict__ mla_gate, bf16* __restrict__ gated, uint8_t* lamport,
     const unsigned long long* __restrict__ peers, int* state, int* err,
     int rank, int R, long long stage_bytes, long long timeout_ns) {
@@ -293,6 +319,43 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
   const int lane = threadIdx.x % LANES, sub = threadIdx.x / LANES;
   for (int it = blockIdx.x; it < R * (HEADS / HPB); it += gridDim.x) {
     const int b = it / (HEADS / HPB), h = it % (HEADS / HPB) * HPB + sub;
+#ifdef CAKE
+    const long long rec = (long long)b * HEADS + h;
+    const float* ms = part_max + rec * split;
+    const float* ss = part_sum + rec * split;
+    const uint4* src = reinterpret_cast<const uint4*>(part_o + rec * split * LAT) + lane;
+    float l = -CUDART_INF_F;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (seq_lens[b] != 0) {
+      float m = -CUDART_INF_F;
+#pragma unroll 1
+      for (int i = 0; i < split; ++i) m = fmaxf(m, split_lse(ms[i], ss[i]));
+      if (m != -CUDART_INF_F) {
+        float a[VEC] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        float den = 0.f;
+#pragma unroll 4
+        for (int i = 0; i < split; ++i) {
+          const float li = split_lse(ms[i], ss[i]);
+          if (li == -CUDART_INF_F) continue;
+          const float w = ex2(li - m);
+          const uint4 x = src[i * LANES];
+          const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&x);
+          den += w;
+#pragma unroll
+          for (int k = 0; k < VEC / 2; ++k) {
+            const float2 f = __bfloat1622float2(x2[k]);
+            a[2 * k] = fmaf(w, f.x, a[2 * k]), a[2 * k + 1] = fmaf(w, f.y, a[2 * k + 1]);
+          }
+        }
+        const float r = 1.0f / den;
+        __nv_bfloat162* v2 = reinterpret_cast<__nv_bfloat162*>(&v);
+#pragma unroll
+        for (int k = 0; k < VEC / 2; ++k) v2[k] = __floats2bfloat162_rn(a[2 * k] * r, a[2 * k + 1] * r);
+        v = make_uint4(unpoison(v.x), unpoison(v.y), unpoison(v.z), unpoison(v.w));
+        l = (m + lg2(den)) * (1.0f / LOG2E);
+      }
+    }
+#else
     // split 0 is loaded with the row's length, whether or not the row has any position here
     const long long rec = (long long)b * M_TILE + h;
     const float* ls = acc_lse + rec * split_max;
@@ -354,6 +417,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
       v = make_uint4(unpoison(v.x), unpoison(v.y), unpoison(v.z), unpoison(v.w));
       l *= 1.0f / LOG2E;
     }
+#endif
     uint4* dst = reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(peers[h / HL]) + stage) + rank * slot +
                  ((long long)b * HL + h % HL) * REC;
     dst[lane] = v;

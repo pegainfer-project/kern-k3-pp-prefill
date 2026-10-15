@@ -31,12 +31,20 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from k3_hosted import hosted  # noqa: E402
 
 KV_LORA, ROPE = 512, 64
-TOKEN_BYTES = (KV_LORA + ROPE) * 2
+ROW = KV_LORA + ROPE
+TOKEN_BYTES = ROW * 2
 KERNEL_BLOCK = 64
 BLOCK_ALIGN = 128
-# An MLA layer's latent as 64-token kernel blocks: [blocks][1 head][64][576] bf16.
-MLA_HOST = {"dtype": "bf16", "shape": [0, 1, KERNEL_BLOCK, TOKEN_BYTES // 2],
-            "strides": [KERNEL_BLOCK * TOKEN_BYTES // 2, TOKEN_BYTES // 2, TOKEN_BYTES // 2, 1]}
+
+
+def mla_host(token: int) -> dict:
+    """An MLA layer's latent as 64-token kernel blocks: [blocks][1 head][64][576], bf16, or the e4m3
+    bytes of SGLang's fp8 cache (`token` 576)."""
+    return {"dtype": {TOKEN_BYTES: "bf16", ROW: "u8"}[token], "shape": [0, 1, KERNEL_BLOCK, ROW],
+            "strides": [KERNEL_BLOCK * ROW, ROW, ROW, 1]}
+
+
+MLA_HOST = mla_host(TOKEN_BYTES)
 
 
 def page_bytes(line: int) -> int:
@@ -66,15 +74,15 @@ def rebind(call: dict) -> dict:
     return {**call, "args": [{**a, "state": renamed(a["state"])} if "state" in a else a for a in call["args"]]}
 
 
-def check_mla(name: str, op: dict) -> None:
-    """The MLA kernels already read `MLA_HOST`'s kernel blocks."""
+def check_mla(name: str, op: dict, token: int = TOKEN_BYTES) -> None:
+    """The MLA kernels already read `mla_host(token)`'s kernel blocks: as pages, or as one run of rows."""
     args = [a for l in op["impl"]["launches"] for a in l.get("args", [])]
     if name == "mla_prep":
-        assert {"i64": KERNEL_BLOCK * TOKEN_BYTES // 2} in args, "`mla_prep` page stride is not `MLA_HOST`'s"
+        assert {"i64": KERNEL_BLOCK * ROW} in args, "`mla_prep` page stride is not `MLA_HOST`'s"
     if name == "mla_attn":
         maps = [f["tensormap"] for a in args if "pack" in a for f in a["pack"]["fields"] if "tensormap" in f]
         pages = [t for t in maps if t["dims"][-1] == 0]
-        assert pages and all(t["strides"] == [TOKEN_BYTES, KERNEL_BLOCK * TOKEN_BYTES] for t in pages), \
+        assert pages and all(t["strides"] in ([token, KERNEL_BLOCK * token], [token]) for t in pages), \
             "`mla_attn` page tensormaps are not `MLA_HOST`'s kernel blocks"
 
 

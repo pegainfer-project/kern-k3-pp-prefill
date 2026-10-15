@@ -47,6 +47,12 @@ on one GPU holding every expert, with nothing to exchange or sum: the oracle
 the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 (one KDA layer, one MoE layer) has no MLA layer and no paged state.
 
+`--kv fp8` (D over a group): the MLA cache is SGLang's fp8 one, e4m3 at scale
+1. The append and the absorbed query land in e4m3 as SGLang casts them
+(k3_mla_prep's KV_FP8 build, k3_mla_absorb_mma's Q_FP8 build), the attention
+is FlashInfer's Cake kernel (source/flashinfer-cake-k3-mla), and the
+exchange's CAKE build merges its splits with the members'.
+
 The kernels are kern's own (docs/k3-kernel-abi.md, source/k3_*.cu): B is a
 runtime argument, every launch takes one row per block.x, and the landing /
 residual / norm / append work is fused into its neighbours. The launch
@@ -118,6 +124,20 @@ MLA_SHORT_SPLITS = 16
 # o_bf16, the keys two pieces share fewer than SPLIT_ROWS more of latent_g / kv_exp.
 SPLIT_ROWS, SPLIT_EXTRA = 512, 1024
 MLA_REDUCE_SMEM = 1024    # 256-split reducer scratch
+
+# D's MLA decode attention over SGLang's fp8 cache (--kv fp8): FlashInfer's
+# Cake-generated Kimi-K3 kernel (source/flashinfer-cake-k3-mla), its wide
+# route, a two-CTA cluster per (row, split). SGLang captures a graph planned
+# for the longest context; Cake's planner (`plan_attention`, 152 SMs, a
+# member's 40,960 positions of 327,680) then sends every batch down this
+# route with all rows as the same splits, (first batch, last batch, splits):
+CAKE_MAIN = "kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653"
+CAKE_SMEM = 232448
+CAKE_LOCAL_CTX = 40960
+CAKE_SPLITS = ((1, 1, 64), (2, 2, 36), (3, 3, 25), (4, 4, 19), (5, 5, 15), (6, 6, 12), (7, 7, 10), (8, 8, 9),
+               (9, 9, 8), (10, 10, 7), (11, 12, 6), (13, 15, 5), (16, 19, 4), (20, 25, 3), (26, 30, 5), (31, 38, 2),
+               (39, 45, 5), (46, 50, 3), (51, 64, 1))
+CAKE_ROWS = max(hi * n for _, hi, n in CAKE_SPLITS)  # a batch's rows times its splits, at most
 
 T = "tokens"
 HF = "language_model."
@@ -254,11 +274,39 @@ def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + R
     }
 
 
+def cake_attn_op(batch_max):
+    """The Cake attention: per batch range of CAKE_SPLITS, one launch whose
+    every row runs as that range's splits, its partials left for the exchange.
+    Interface: q_abs (e4m3 [rows][576]) | kv | block_table | seq_lens |
+    cu_seqlens_q | part_o | part_max | part_sum | max_pages, at most `batch_max` rows."""
+    tmap = lambda param, rows, box0, swizzle: pack(128, {"at": 0, "tensormap": {
+        "param": param, "dtype": "u8", "dims": [KV_A, rows], "strides": [KV_A], "box": [box0, 64],
+        "swizzle": swizzle}})
+    q, kv = (lambda box0, sw: tmap(0, batch_max * HEADS, box0, sw)), (lambda box0, sw: tmap(1, 0, box0, sw))
+    params = ["bytes<128>"] * 5 + ["out buffer<bf16>", "out buffer<f32>", "out buffer<f32>", "out buffer<bf16>",
+                                   "in buffer<i32>", "in buffer<i32>", "in buffer<i32>", "f32", "f32", "i32", "i32",
+                                   "i32", "i32", "i32"]
+    args = lambda n: [q(128, 128), kv(128, 128), q(64, 64), kv(64, 64), kv(128, 128),
+                      {"param": 5}, {"param": 6}, {"param": 7}, {"param": 5}, {"param": 3}, {"param": 4}, {"param": 2},
+                      {"f32": (NOPE_DIM + ROPE) ** -0.5 * math.log2(math.e)}, {"f32": 1.0}, {"i32": HEADS},
+                      {"i32": n}, {"param": 8}, {"i32": 1}, {"i32": 0}]
+    return {
+        "params": ["in buffer<fp8e4m3>", "in state", "in buffer<i32>", "in buffer<i32>", "in buffer<i32>",
+                   "out buffer<bf16>", "out buffer<f32>", "out buffer<f32>", "i32"],
+        "impl": {"launches": [
+            {**module("cake_k3_mla_wide"), "entry": CAKE_MAIN, "params": params, "args": args(n), "block": [384, 1, 1],
+             "grid": [{"mul": [T, 2 * n]}, 1, 1], "cluster": [2, 1, 1], "shared_mem": CAKE_SMEM,
+             "when": {"var": T, "min": lo, "max": hi}}
+            for lo, hi, n in CAKE_SPLITS]},
+    }
+
+
 def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, experts=224, pack=16,
-          peer_ar=False, mla_short=128):
+          peer_ar=False, mla_short=128, kv="bf16"):
     """P with `chunk_max`, else D over a `tp` group (see the module doc), of layers [0, `end`). `experts`: the
     checkpoint's routed experts (CHECKPOINTS); `pack`: P's sequences a call; `peer_ar`: D's sums by the
-    group's Lamport one-shot (source/peer_allreduce_bf16.cu) instead of NCCL."""
+    group's Lamport one-shot (source/peer_allreduce_bf16.cu) instead of NCCL; `kv`: D's MLA cache, bf16 or
+    SGLang's fp8 (e4m3, scale 1) under the Cake attention."""
     chunk = chunk_max > 0
     decode = not chunk
     assert 0 < end <= LAYERS
@@ -269,6 +317,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # holding every expert, with nothing to exchange or sum.
     xchg = decode and tp > 1
     fused_ar = xchg and peer_ar
+    fp8 = kv == "fp8"
+    assert kv in ("bf16", "fp8")
+    assert not fp8 or (xchg and seqs_max <= CAKE_SPLITS[-1][1] and -(-max_ctx // tp) == CAKE_LOCAL_CTX), \
+        f"the fp8 cache is D's under DCP, its Cake plan a member's {CAKE_LOCAL_CTX} positions"
     # P routes its MoE in one call (k3_moe_route.cu), which takes the experts
     # by float4s: the pruned checkpoint's 224 route by FlashInfer's kernels,
     # the latent and the shared expert apart.
@@ -407,7 +459,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                                   **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl}
                                                      if kfused else {})})]},
         },
-        "mla_attn": mla_attn_op(seqs_max, mla_split_max, reduce=not xchg),
+        "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg),
         } if decode else {}),
         "gemm_bf16": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
@@ -483,14 +535,15 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<f32>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "inout state",
                        "i64", "i64", "out buffer<bf16>", "out buffer<bf16>", "i32"],
             "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 3, 1],
-                                         defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l}) if tp > 1
+                                         defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l,
+                                                  **({"KV_FP8": 1} if fp8 else {})}) if tp > 1
                                   else launch("k3_mla_prep", "kern_k3_mla_prep")]},
         },
         # every member absorbs the whole batch's 96 heads, at most `seqs` rows (tensor cores)
         "mla_absorb": {
-            "params": ["in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
+            "params": ["in buffer<f32>", "in buffer<bf16>", f"out buffer<{'fp8e4m3' if fp8 else 'bf16'}>", "i32"],
             "impl": {"launches": [launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[1, HEADS, 4],
-                                         block=[256, 1, 1])]},
+                                         block=[256, 1, 1], defines={"Q_FP8": 1} if fp8 else None)]},
         },
         "mla_vup_gate": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
@@ -583,12 +636,22 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # The MLA partials change hands in one kernel (source/k3_dcp.cu): every
         # head's partial pushed into its owner's Lamport stage over NVLink, the
         # members' partials of this member's heads merged by their LSE, expanded by v-up and gated.
+        tail = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "inout buffer<u8>", "in buffer<u64>",
+                "inout buffer<i32>", "out buffer<i32>", "i32", "i32", "i64", "i64"]
+        xg = lambda **extra: launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1], block=[256, 1, 1],
+                                    smem=HEAD_DIM // 2 * KV_LORA * 2, **extra)
+        # Cake's partials, every row as its batch's splits: a launch per range of CAKE_SPLITS, the count a literal
         ops["dcp_exchange"] = {
-            "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "i32", "in buffer<bf16>",
-                       "in buffer<bf16>", "out buffer<bf16>", "inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>", "out buffer<i32>", "i32", "i32", "i64",
-                       "i64"],
-            "impl": {"launches": [launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1],
-                                         block=[256, 1, 1], smem=HEAD_DIM // 2 * KV_LORA * 2)]},
+            "params": ["in buffer<bf16>", "in buffer<f32>", "in buffer<f32>", "in buffer<i32>", *tail],
+            "impl": {"launches": [
+                xg(defines={"CAKE": 1}, params=["in buffer<bf16>", "in buffer<f32>", "in buffer<f32>", "in buffer<i32>",
+                                                "i32", *tail],
+                   args=[*({"param": i} for i in range(4)), {"i32": n}, *({"param": i} for i in range(4, 15))],
+                   when={"var": T, "min": lo, "max": hi})
+                for lo, hi, n in CAKE_SPLITS]},
+        } if fp8 else {
+            "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "i32", *tail],
+            "impl": {"launches": [xg()]},
         }
         ops["dcp_init"] = {
             "params": ["inout buffer<u8>", "i64"],
@@ -699,7 +762,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     kv_shard = {"shard": {"group": "tp", "by": "position"}} if xchg else {}
     kda_shard = ({"shard": {"group": "tp", "by": "heads", "segments": [[1, KDA_REC_BYTES], [9, INNER * 2]]}}
                  if xchg else {})
-    states = {**{f"kv.{i}": {"bytes_per_token": LATENT_ROW * 2, **kv_shard} for i in mla_layers},
+    states = {**{f"kv.{i}": {"bytes_per_token": LATENT_ROW * (1 if fp8 else 2), **kv_shard} for i in mla_layers},
               **{f"kda.{i}": {"bytes_per_seq": line_l, **kda_shard} for i in kda_layers}}
 
     def weight(name, shape, bind, dtype="bf16"):
@@ -805,12 +868,19 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         work("q_norm", Q_LORA, var=chunk_max + SPLIT_EXTRA if chunk else T)
     if decode and mla:
         work("q_partial", Q_B, "f32")
-        work("q_abs", HEADS * LATENT_ROW)
+        work("q_abs", HEADS * LATENT_ROW, "fp8e4m3" if fp8 else "bf16")
         work("o_lat", HEADS * KV_LORA)
         work("mla_lse", HEADS, "f32")
         work("mla_acc_o", mla_split_max * MLA_M_TILE * KV_LORA, "f32", var=seqs_max)
         work("mla_acc_lse", mla_split_max * MLA_M_TILE, "f32", var=seqs_max)
         buffers["mla_bsk"] = {"dtype": "i32", "shape": [T], "kind": "workspace"}
+    if fp8:
+        # Cake's partials: a batch's rows times its splits, each row's split-major
+        work("mla_part_o", HEADS * KV_LORA, var=CAKE_ROWS)
+        work("mla_part_max", HEADS, "f32", var=CAKE_ROWS)
+        work("mla_part_sum", HEADS, "f32", var=CAKE_ROWS)
+        buffers["cu_seqlens_q"] = {"dtype": "i32", "shape": [seqs_max + 1], "kind": "input", "fill": "cu_seqlens",
+                                   "domain": {"min": 0, "max": seqs_max, "monotone": True}}
     if chunk:
         work("normed_last", H, var="seqs")
         # the absorbed attention of a short call (at most mla_short rows)
@@ -1041,17 +1111,25 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B)
                     gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
-                    step(L + "attn", "mla_attn", b("q_abs"), b("q_abs", KV_LORA * 2), {"state": kv, "offset": 0},
-                         {"state": kv, "offset": KV_LORA * 2}, b("block_table"), b("seq_lens"), b("mla_bsk"),
-                         b("o_lat"), b("mla_lse"), b("mla_acc_o"), b("mla_acc_lse"), B, i32(max_pages))
-                    if xchg:
-                        # every head over this member's positions → this member's heads over all of them
-                        step(L + "dcp", "dcp_exchange", b("mla_acc_o"), b("mla_acc_lse"), b("seq_lens"), b("mla_bsk"),
-                             i32(mla_split_max), w("w_kv_b_l"), b("mla_gate"), b("gated"),
-                             b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"), {"rank": "tp"}, B,
-                             i64(dcp_stage), i64(TP_TIMEOUT_NS))
+                    if fp8:
+                        step(L + "attn", "mla_attn", b("q_abs"), {"state": kv}, b("block_table"), b("seq_lens"),
+                             b("cu_seqlens_q"), b("mla_part_o"), b("mla_part_max"), b("mla_part_sum"), i32(max_pages))
+                        step(L + "dcp", "dcp_exchange", b("mla_part_o"), b("mla_part_max"), b("mla_part_sum"),
+                             b("seq_lens"), w("w_kv_b_l"), b("mla_gate"), b("gated"), b("dcp_lamport"),
+                             b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"), {"rank": "tp"}, B, i64(dcp_stage),
+                             i64(TP_TIMEOUT_NS))
                     else:
-                        step(L + "vup", "mla_vup_gate", b("o_lat"), w("w_kv_b"), b("mla_gate"), b("gated"), B)
+                        step(L + "attn", "mla_attn", b("q_abs"), b("q_abs", KV_LORA * 2), {"state": kv, "offset": 0},
+                             {"state": kv, "offset": KV_LORA * 2}, b("block_table"), b("seq_lens"), b("mla_bsk"),
+                             b("o_lat"), b("mla_lse"), b("mla_acc_o"), b("mla_acc_lse"), B, i32(max_pages))
+                        if xchg:
+                            # every head over this member's positions → this member's heads over all of them
+                            step(L + "dcp", "dcp_exchange", b("mla_acc_o"), b("mla_acc_lse"), b("seq_lens"),
+                                 b("mla_bsk"), i32(mla_split_max), w("w_kv_b_l"), b("mla_gate"), b("gated"),
+                                 b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"), {"rank": "tp"},
+                                 B, i64(dcp_stage), i64(TP_TIMEOUT_NS))
+                        else:
+                            step(L + "vup", "mla_vup_gate", b("o_lat"), w("w_kv_b"), b("mla_gate"), b("gated"), B)
             else:
                 line = b("kda.line_index", kda_k * seqs_max * 4)
                 kda_k += 1
@@ -1334,6 +1412,8 @@ def main():
     ap.add_argument("--peer-ar", action="store_true",
                     help="D: the sums by the Lamport one-shot over the group's peers instead of NCCL")
     ap.add_argument("--max-ctx", type=int, default=16384)
+    ap.add_argument("--kv", choices=("bf16", "fp8"), default="bf16",
+                    help="D: the MLA cache, bf16 or SGLang's fp8 (e4m3) under FlashInfer's Cake attention")
     ap.add_argument("--experts", type=int, default=224, choices=sorted(CHECKPOINTS),
                     help="the checkpoint's routed experts: 224 the pruned one, 896 the full model")
     ap.add_argument("--moe-variants", metavar="FC1,FC2",
@@ -1345,7 +1425,7 @@ def main():
         ap.error("D absorbs on tensor cores for at most 64 rows (k3_mla_absorb_mma BMAX)")
     names = tuple(a.moe_variants.split(",")) if a.moe_variants else None
     json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.experts, a.pack,
-                    a.peer_ar, a.mla_short),
+                    a.peer_ar, a.mla_short, a.kv),
               sys.stdout, indent=1)
     print()
 
