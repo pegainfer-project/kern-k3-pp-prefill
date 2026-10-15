@@ -1,8 +1,11 @@
 # Prefill roofline: PP8 stage 0 at production shapes
 
-Every kernel full Kimi-K3 prefill runs on kern, measured at the shapes the service sees, priced against a
+Every kernel PP8 stage 0 of Kimi-K3 prefill runs on kern, measured at the shapes the service sees, priced against a
 floor built from measured ceilings, and explained where it misses. Measured 2026-10-14 on one GB300
 (152 SMs, 1400 W board cap), kern master `304c0d4`, the PP8 capacity deployment's stage 0 manifest.
+Stages 1–6 run the same kernels on other layers. Stage 7 runs 9 layers instead of 12 and then
+`out.last`, `out.lm_head` and `out.argmax` over one row per sequence, which this note does not price; the head's
+weight read floors at 0.32 ms (163840 × 7168 bf16 at 7332 GB/s), so stage 7 does not set the pipeline's time.
 
 **Summary.**
 
