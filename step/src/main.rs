@@ -269,8 +269,13 @@ fn main() -> anyhow::Result<()> {
         }
         rt.write_input(&name, &le(&t, i32::to_le_bytes))?;
     }
+    // the attention's query offsets (an fp8-cache manifest's), every sequence one row
+    let cu = m.buffers.contains_key("cu_seqlens_q").then_some(seqs_max);
     if benching {
-        return bench(&mut rt, &a, &leases, &pad, il, paged);
+        return bench(&mut rt, &a, &leases, &pad, il, paged, cu);
+    }
+    if let Some(n) = cu {
+        rt.write_input("cu_seqlens_q", &le(&cu_seqlens(b, n), i32::to_le_bytes))?;
     }
 
     let vocab = match m.buffers["logits"].shape[1] {
@@ -358,16 +363,32 @@ fn token(s: usize, r: usize) -> i64 {
     1000 + ((x ^ (x >> 32)) % 100_000) as i64
 }
 
+/// `cu_seqlens_q` for `rows` sequences of one row each, over a buffer of `seqs_max + 1`.
+fn cu_seqlens(rows: usize, seqs_max: usize) -> Vec<i32> {
+    (0..=seqs_max).map(|i| i.min(rows) as i32).collect()
+}
+
 fn quantile(sorted: &[f64], q: f64) -> f64 {
     sorted[((sorted.len() - 1) as f64 * q).round() as usize]
 }
 
-fn bench(rt: &mut Runtime, a: &Args, leases: &[kern_pool::Lease], pad: &kern_pool::Lease, il: Interleave, paged: bool) -> anyhow::Result<()> {
+fn bench(
+    rt: &mut Runtime,
+    a: &Args,
+    leases: &[kern_pool::Lease],
+    pad: &kern_pool::Lease,
+    il: Interleave,
+    paged: bool,
+    cu: Option<usize>,
+) -> anyhow::Result<()> {
     let me = a.rank;
     let mut report = Vec::new();
     let mut step = 0;
     for (&p, &rows) in a.ctx.iter().flat_map(|c| a.bench.iter().map(move |r| (c, r))) {
         let vars = BTreeMap::from([("tokens".to_string(), rows as u64), ("seqs".to_string(), rows as u64)]);
+        if let Some(n) = cu {
+            rt.write_input("cu_seqlens_q", &le(&cu_seqlens(rows, n), i32::to_le_bytes))?;
+        }
         if paged {
             let slot: Vec<i64> = leases[..rows]
                 .iter()
