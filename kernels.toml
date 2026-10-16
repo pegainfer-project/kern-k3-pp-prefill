@@ -193,3 +193,22 @@ defines = { K12_LD = 49408 }
 sha256 = "3bf9ee3f04807b0130f3e05dadc1ffcb787f6091bb2e3bbbd0591d42e53543c9"
 source = "source/k3_kda_core.cu"
 defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, LDS = 6400, LINE_GUARD = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_spec+HEADS=12"]
+sha256 = "41d4b93c0b9d44418d84bf2239f9aa4fba477b3a4d4302c344f4efb01c7a9afa"
+source = "source/k3_kda_spec.cu"
+defines = { HEADS = 12 }
+
+[kernels."k3_kda_verify+HEADS=12"]
+sha256 = "e3a87313df5ee7728a3576268bd0e116320fd1a743184d7019ee9d054fb5b4fb"
+prebuilt = "prebuilt/k3_kda_verify+HEADS=12.cubin"
+source = "source/sglang-kda-spec/kda_decode_mtp.py"
+build = "source/sglang-kda-spec/build.py"
+upstream = "SGLang c55790d3, python/sglang/kernels/ops/attention/kda_decode_mtp.py (CuTe DSL, Apache-2.0)"
+
+[kernels."k3_kda_fold+HEADS=12"]
+sha256 = "844bf79dc504d21c029fc04549ec3999b72caf8e675887dd45329364647e9d98"
+prebuilt = "prebuilt/k3_kda_fold+HEADS=12.cubin"
+source = "source/sglang-kda-spec/kda_replayssm_spec_decode.py"
+build = "source/sglang-kda-spec/build.py"
+upstream = "SGLang c55790d3, python/sglang/kernels/ops/attention/fla/kda_replayssm_spec_decode.py (Triton, Apache-2.0)"

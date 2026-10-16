@@ -10,6 +10,7 @@ bytes as well.
 | `trtllm_fmha_ctx_h192_v128.cubin` | FlashInfer 0.6.18 TRT-LLM gen FMHA bundle; the context kernel FlashInfer selects for DeepSeek-style MLA prefill on GB300 | `LICENSE.trtllm-gen.txt` |
 | `flash_kda_d128_varlen.cubin` | the vendored FlashKDA in `../source/flash-kda/` built with `KERN_DEFINES=-DKERN_VARLEN` (upstream's varlen instantiation, for the packed prefill) | MIT, see that directory |
 | `flashinfer_moe_routing.cubin` | built from `../source/flashinfer-moe-routing/` | Apache-2.0, see that directory and its `PROVENANCE.md` |
+| `k3_kda_verify+HEADS=12.cubin`, `k3_kda_fold+HEADS=12.cubin` | SGLang's KDA speculative verify (CuTe DSL) and ReplaySSM fold (Triton), AOT-compiled from `../source/sglang-kda-spec/` | Apache-2.0, see that directory and its `PROVENANCE.md` |
 
 No source recipe is available here for the three TRT-LLM gen cubins.
 
@@ -18,4 +19,4 @@ bundled in FlashInfer 0.6.13, via `KERN_DEFINES=-DKERN_VARLEN
 CUTLASS_INCLUDE=<cutlass>/include ../source/flash-kda/build.sh <out>`.
 
 `flashinfer_moe_routing.cubin` rebuilds byte for byte with the recipe in its
-`PROVENANCE.md`.
+`PROVENANCE.md`; so do the two SGLang cubins with theirs (`build.py`).
