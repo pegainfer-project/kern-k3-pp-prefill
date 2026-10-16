@@ -20,7 +20,7 @@ tools that check them.
 | [`scripts/k3_vllm.py`](scripts/k3_vllm.py) | a D manifest as vLLM's model forward, on [`k3_hosted.py`](scripts/k3_hosted.py)'s program boundary |
 | [`scripts/k3_sglang.py`](scripts/k3_sglang.py) | the same D as SGLang's model forward |
 | [`kernels.toml`](kernels.toml) | every module the manifests pin: SHA-256, source and defines, or prebuilt path and upstream |
-| [`source/`](source/) | the handwritten CUDA (Apache-2.0, [`source/LICENSE`](source/LICENSE)), vendored FlashKDA (MIT), FlashInfer MoE routing and FlashInfer's Cake Kimi-K3 MLA decode (Apache-2.0), each with its `LICENSE` and `PROVENANCE.md` |
+| [`source/`](source/) | the handwritten CUDA (Apache-2.0, [`source/LICENSE`](source/LICENSE)), vendored FlashKDA (MIT), FlashInfer MoE routing, FlashInfer's Cake Kimi-K3 MLA decode and SGLang's KDA speculative verify and ReplaySSM fold (Apache-2.0), each with its `LICENSE` and `PROVENANCE.md` |
 | [`prebuilt/`](prebuilt/) | the cubins with no source recipe here; origins and licenses in [`prebuilt/README.md`](prebuilt/README.md) |
 | [`step/`](step/) | `k3_step`: a decode manifest teacher-forced, one process per rank |
 | [`harness/`](harness/) | kernel acceptance runs and the error-budget study |

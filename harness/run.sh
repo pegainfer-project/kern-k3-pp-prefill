@@ -2,10 +2,10 @@
 # The D1 acceptance run: every kernel a full-K3 decode at TP8 / EP8 / DCP8
 # adds, against CPU references, at the decode batches, plus the SASS check.
 #
-#   CUDA_VISIBLE_DEVICES=<one free GPU> harness/run.sh [sass|tp8|d1|conv ...]
+#   CUDA_VISIBLE_DEVICES=<one free GPU> harness/run.sh [sass|tp8|d1|conv|spec ...]
 #
 # Needs build/ from scripts/build.py (the pinned cubins, hashes checked) and
-# nvcc/cuobjdump (NVCC_BIN, default /usr/local/cuda-13.1/bin). Four parts:
+# nvcc/cuobjdump (NVCC_BIN, default /usr/local/cuda-13.1/bin). Five parts:
 #   sass  every D1 cubin: no stack, no local memory, no .MULTICAST in its SASS
 #   tp8   harness/k3 (kern's K3 kernel harness, copied from its tools/k3-harness)
 #         built with the TP8 rank's model constants (HEADS 12, EXPERTS 896; the
@@ -15,6 +15,8 @@
 #         with kern's finalize
 #   conv  harness/kda_conv_layout.cu: kda_core's CONV_TAP_MAJOR + LINE_GUARD build (an engine's conv
 #         pool, padded rows at slot -1) against the TP8 D build it varies, bit for bit
+#   spec  harness/kda_spec.cu: a speculative round's KDA (gate, SGLang's verify, its ReplaySSM fold, the
+#         conv commit) against eight k3_kda_core steps of the TP8 D build
 # Prints one RESULT line per run and a summary; exit 1 if anything fails.
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,6 +120,15 @@ conv() {
   for B in 2 8 64; do
     r "$out/kda_conv_layout" --B "$B" --base "$(cubin k3_kda_core+$d+WSM_FA=12+WSM_LDS=6400)" \
       --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+$d+LINE_GUARD=1+WSM_FA=12+WSM_LDS=6400)"
+  done
+}
+
+spec() {
+  build "$here/kda_spec.cu" "$out/kda_spec"
+  for N in 1 4 32; do
+    r "$out/kda_spec" --N "$N" --core "$(cubin k3_kda_core+HEADS=12+KDA_CONV=1+LDS=6400+WSM_FA=12+WSM_LDS=6400)" \
+      --verify "$(cubin k3_kda_verify+HEADS=12)" --fold "$(cubin k3_kda_fold+HEADS=12)" \
+      --glue "$(cubin k3_kda_spec+HEADS=12)"
   done
 }
 
