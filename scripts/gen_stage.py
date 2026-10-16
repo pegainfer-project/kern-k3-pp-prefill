@@ -50,8 +50,10 @@ the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 `--kv fp8` (D over a group): the MLA cache is SGLang's fp8 one, e4m3 at scale
 1. The append and the absorbed query land in e4m3 as SGLang casts them
 (k3_mla_prep's KV_FP8 build, k3_mla_absorb_mma's Q_FP8 build), the attention
-is FlashInfer's Cake kernel (source/flashinfer-cake-k3-mla), and the
-exchange's CAKE build merges its splits with the members'.
+is FlashInfer's Cake kernel (source/flashinfer-cake-k3-mla), its splits
+planned by FlashInfer's planner at 148 SMs for a member's share of the
+capture context (scripts/cake_plan.py), and the exchange's CAKE build
+merges its splits with the members'.
 
 The kernels are kern's own (docs/k3-kernel-abi.md, source/k3_*.cu): B is a
 runtime argument, every launch takes one row per block.x, and the landing /
@@ -70,6 +72,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(1, str(pathlib.Path(os.environ["KERN"]) / "tools"))
 # This directory's forks first: kern's modules put kern's tools/ at the head of sys.path on import.
+import cake_plan
 import k3_moe_bmm
 from pinned import module
 import trtllm_fmha_abi
@@ -128,24 +131,21 @@ MLA_REDUCE_SMEM = 1024    # 256-split reducer scratch
 # D's MLA decode attention over SGLang's fp8 cache (--kv fp8): FlashInfer's
 # Cake-generated Kimi-K3 kernel (source/flashinfer-cake-k3-mla), its wide
 # route, a two-CTA cluster per (row, split). SGLang captures a graph planned
-# for the longest context; Cake's planner (`plan_attention`, 152 SMs, a
-# member's 40,960 positions of 327,680) then sends every batch down this
-# route with all rows as the same splits, (first batch, last batch, splits):
+# for the longest context; Cake's planner (`plan_attention`, ported in
+# scripts/cake_plan.py) for a member's share of it then sends every batch
+# down this route with all rows as the same splits, (first batch, last
+# batch, splits). It plans at 148 SMs, B300's count; GB300 runs the same plan.
 CAKE_MAIN = "kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653"
 CAKE_SMEM = 232448
-CAKE_LOCAL_CTX = 40960
-CAKE_SPLITS = ((1, 1, 64), (2, 2, 36), (3, 3, 25), (4, 4, 19), (5, 5, 15), (6, 6, 12), (7, 7, 10), (8, 8, 9),
-               (9, 9, 8), (10, 10, 7), (11, 12, 6), (13, 15, 5), (16, 19, 4), (20, 25, 3), (26, 30, 5), (31, 38, 2),
-               (39, 45, 5), (46, 50, 3), (51, 64, 1))
-CAKE_ROWS = max(hi * n for _, hi, n in CAKE_SPLITS)  # a batch's rows times its splits, at most
+CAKE_PLAN_SMS = 148
 
 T = "tokens"
 HF = "language_model."
 ROWS = "rows"
 CTX = "ctx"
-TP_AR_GRID = 152  # the GB300's SM count, a multiple of the cluster of 8 and under the 256-row flag table
+TP_AR_GRID = 144  # k3_ar_fused.cu: every block resident (one an SM) and G >= rows (at most 64), on 148 and 152 SMs
 TP_TIMEOUT_NS = 30_000_000_000  # a deadline that passes traps: long enough for any start skew
-DCP_GRID = 256  # two exchange blocks fit an SM: every block resident with room to spare
+DCP_GRID = 2 * 144  # k3_dcp.cu bounds the exchange to two blocks an SM: every block resident on 148 and 152 SMs
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
 PF_OPS = {"ar_attnres_rms", "ar_finalize_rms"}
@@ -274,8 +274,8 @@ def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + R
     }
 
 
-def cake_attn_op(batch_max):
-    """The Cake attention: per batch range of CAKE_SPLITS, one launch whose
+def cake_attn_op(batch_max, splits):
+    """The Cake attention: per batch range of `splits`, one launch whose
     every row runs as that range's splits, its partials left for the exchange.
     Interface: q_abs (e4m3 [rows][576]) | kv | block_table | seq_lens |
     cu_seqlens_q | part_o | part_max | part_sum | max_pages, at most `batch_max` rows."""
@@ -297,7 +297,7 @@ def cake_attn_op(batch_max):
             {**module("cake_k3_mla_wide"), "entry": CAKE_MAIN, "params": params, "args": args(n), "block": [384, 1, 1],
              "grid": [{"mul": [T, 2 * n]}, 1, 1], "cluster": [2, 1, 1], "shared_mem": CAKE_SMEM,
              "when": {"var": T, "min": lo, "max": hi}}
-            for lo, hi, n in CAKE_SPLITS]},
+            for lo, hi, n in splits]},
     }
 
 
@@ -319,8 +319,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     fused_ar = xchg and peer_ar
     fp8 = kv == "fp8"
     assert kv in ("bf16", "fp8")
-    assert not fp8 or (xchg and seqs_max <= CAKE_SPLITS[-1][1] and -(-max_ctx // tp) == CAKE_LOCAL_CTX), \
-        f"the fp8 cache is D's under DCP, its Cake plan a member's {CAKE_LOCAL_CTX} positions"
+    assert not fp8 or (xchg and seqs_max <= 64), "the fp8 cache is D's under DCP, at most 64 rows"
+    # Cake's plan for a member's share of the capture context; the planner refuses fewer than 8192 positions.
+    cake_splits = cake_plan.cake_splits(-(-max_ctx // tp), CAKE_PLAN_SMS) if fp8 else ()
+    cake_rows = max((hi * n for _, hi, n in cake_splits), default=0)  # a batch's rows times its splits, at most
     # P routes its MoE in one call (k3_moe_route.cu), which takes the experts
     # by float4s: the pruned checkpoint's 224 route by FlashInfer's kernels,
     # the latent and the shared expert apart.
@@ -459,7 +461,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                                   **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl}
                                                      if kfused else {})})]},
         },
-        "mla_attn": cake_attn_op(seqs_max) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg),
+        "mla_attn": cake_attn_op(seqs_max, cake_splits) if fp8 else mla_attn_op(seqs_max, mla_split_max, reduce=not xchg),
         } if decode else {}),
         "gemm_bf16": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
@@ -640,7 +642,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 "inout buffer<i32>", "out buffer<i32>", "i32", "i32", "i64", "i64"]
         xg = lambda **extra: launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1], block=[256, 1, 1],
                                     smem=HEAD_DIM // 2 * KV_LORA * 2, **extra)
-        # Cake's partials, every row as its batch's splits: a launch per range of CAKE_SPLITS, the count a literal
+        # Cake's partials, every row as its batch's splits: a launch per range of the plan, the count a literal
         ops["dcp_exchange"] = {
             "params": ["in buffer<bf16>", "in buffer<f32>", "in buffer<f32>", "in buffer<i32>", *tail],
             "impl": {"launches": [
@@ -648,7 +650,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                                 "i32", *tail],
                    args=[*({"param": i} for i in range(4)), {"i32": n}, *({"param": i} for i in range(4, 15))],
                    when={"var": T, "min": lo, "max": hi})
-                for lo, hi, n in CAKE_SPLITS]},
+                for lo, hi, n in cake_splits]},
         } if fp8 else {
             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "i32", *tail],
             "impl": {"launches": [xg()]},
@@ -876,9 +878,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         buffers["mla_bsk"] = {"dtype": "i32", "shape": [T], "kind": "workspace"}
     if fp8:
         # Cake's partials: a batch's rows times its splits, each row's split-major
-        work("mla_part_o", HEADS * KV_LORA, var=CAKE_ROWS)
-        work("mla_part_max", HEADS, "f32", var=CAKE_ROWS)
-        work("mla_part_sum", HEADS, "f32", var=CAKE_ROWS)
+        work("mla_part_o", HEADS * KV_LORA, var=cake_rows)
+        work("mla_part_max", HEADS, "f32", var=cake_rows)
+        work("mla_part_sum", HEADS, "f32", var=cake_rows)
         buffers["cu_seqlens_q"] = {"dtype": "i32", "shape": [seqs_max + 1], "kind": "input", "fill": "cu_seqlens",
                                    "domain": {"min": 0, "max": seqs_max, "monotone": True}}
     if chunk:

@@ -30,9 +30,9 @@ ALPHA, BETA = 4.0, 25.0
 GLUE, PGLUE, ROUTING, ROUTE = "k3_moe_prefill", "k3_prefill_glue", "flashinfer_moe_routing", "k3_moe_route"
 FC1, FC2 = "trtllm_bmm_mxe4m3_mxe2m1_mxe4m3", "trtllm_bmm_bf16_mxe2m1_mxe4m3"
 SHAPE = "k3-prefill-16k-ep4"
-# k3_moe_route.cu: 16 warps a block, two blocks an SM (GB300: 152) resident for its grid barrier, a quarter of
-# them up to 256 rows; its tables cover 8192 rows.
-ROUTE_WARPS, ROUTE_BLOCKS, ROUTE_BLOCKS_SMALL, ROUTE_ROWS = 16, 2 * 152, 64, 8192
+# k3_moe_route.cu: 16 warps a block, two blocks an SM resident for its grid barrier (2 x 144 fits 148-SM B300
+# and 152-SM GB300), a quarter of them up to 256 rows; its tables cover 8192 rows.
+ROUTE_WARPS, ROUTE_BLOCKS, ROUTE_BLOCKS_SMALL, ROUTE_ROWS = 16, 2 * 144, 64, 8192
 
 
 def ceil_div(a, b):

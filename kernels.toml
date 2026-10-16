@@ -38,11 +38,11 @@ source = "source/k3_conv_silu.cu"
 defines = { HEADS = 12 }
 
 [kernels."k3_dcp"]
-sha256 = "db9b91b8e065c0f72494d74d60b0f21a68fe83f0cebe7333c3d5e777d7eccac1"
+sha256 = "27c8b6f47d7e208d2b189f8233666fdc65a37af5c582fb0340560a0d66ed01d3"
 source = "source/k3_dcp.cu"
 
 [kernels."k3_dcp+CAKE=1"]
-sha256 = "304e62dcc52171660b8fcaf17743021e6a89e84c9f059a14f1535d9ff5b0de3e"
+sha256 = "e03171d447e2c640bf2e658b9145931a212fac814c2525cec542444e74f7a63d"
 source = "source/k3_dcp.cu"
 defines = { CAKE = 1 }
 

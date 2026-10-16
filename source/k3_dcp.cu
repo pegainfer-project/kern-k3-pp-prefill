@@ -287,7 +287,8 @@ __device__ __forceinline__ void await_all(uint4 (&v)[NRANKS], const uint4* p, lo
   }
 }
 
-extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+// Two blocks an SM, so a grid of 2 x 144 is every block resident on 148-SM B300 and 152-SM GB300.
+extern "C" __global__ void __launch_bounds__(256, 2) kern_k3_dcp_exchange(
 #ifdef CAKE
     const bf16* __restrict__ part_o, const float* __restrict__ part_max, const float* __restrict__ part_sum,
     const int* __restrict__ seq_lens, int split,

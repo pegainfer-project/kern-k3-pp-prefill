@@ -82,6 +82,14 @@ Every process needs NCCL 2.30.7 (with its unversioned `libnccl.so`) on
 `LD_LIBRARY_PATH`, and `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` across
 hosts. The head serves the OpenAI completions and chat API.
 
+The same manifests run on HGX B300 (148 SMs): every launch that needs all
+its blocks resident is sized for 148 (the router 2 x 144, the fused TP
+sums 144, the DCP exchange 2 x 144, two of its blocks an SM), and the fp8
+Cake attention's splits are FlashInfer's plan at 148 SMs for a member's
+share of the capture context ([`scripts/cake_plan.py`](scripts/cake_plan.py),
+checked against FlashInfer's own planner by
+[`harness/cake_plan/check.py`](harness/cake_plan/check.py)).
+
 ## Results (GB300)
 
 **1P2D on AgentX (2026-10-11).** P PP8 and two D tiers, 24 GPUs; aiperf
