@@ -15,7 +15,7 @@
 //       kern_k3g_moe_route_init before a stage's first call, every call of a stage's B rows
 //       leaves the barrier and the next call's table and counter zero;
 //     the tables FlashInfer's routing writes for a rank holding every expert, `tile` rows a CTA.
-//   grid (64, 1, 1) up to 256 rows, then (304, 1, 1)   block (512, 1, 1): every block resident
+//   grid (64, 1, 1) up to 256 rows, then (288, 1, 1)   block (512, 1, 1): every block resident
 //   (two an SM) for the grid barrier
 //
 //   kern_k3g_moe_route_init(sync)

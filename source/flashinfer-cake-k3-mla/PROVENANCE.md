@@ -21,10 +21,11 @@ From `csrc/cake_kimi_k3_mla/` of the FlashInfer checkout, unmodified:
 Only this one is vendored, because it is the only program D launches. SGLang
 captures its decode graphs planned for the longest context it admits.
 FlashInfer's planner (`flashinfer/mla/cake_kimi_k3_mla.py`, `plan_attention`)
-at a DCP8 member's 40,960 positions on 152 SMs sends every batch of 1 to 64
-rows down the wide route, and every row runs as the same number of splits
-(`gen_stage.py` `CAKE_SPLITS`). The binding, the row-tile programs and the
-reducers are not needed.
+for a DCP8 member's share of the capture context (at least 8,192 positions),
+planned at 148 SMs, sends every batch of 1 to 64 rows down the wide route, and
+every row runs as the same number of splits (`scripts/cake_plan.py`, checked
+against the planner by `harness/cake_plan/check.py`). The binding, the
+row-tile programs and the reducers are not needed.
 
 ## What is ours
 

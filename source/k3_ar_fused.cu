@@ -87,7 +87,7 @@ namespace cg = cooperative_groups;
 #define KEPS 1e-5f
 #define KTHREADS 1024
 #define TOPK 16
-#define KGRID 152  // the exchanges' grid (gen_stage.py's TP_AR_GRID): one 1024-thread block an SM
+#define KGRID 144  // the exchanges' grid (gen_stage.py's TP_AR_GRID): one 1024-thread block an SM, all resident on 148 SMs
 #ifndef TWO_SHOT_ROWS
 #define TWO_SHOT_ROWS 14
 #endif
