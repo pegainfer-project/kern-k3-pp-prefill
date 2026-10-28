@@ -57,6 +57,35 @@
 #endif
 
 typedef __nv_bfloat16 bf16_t;
+// -DKV_FP8: the latent pages are SGLang's fp8 cache, one e4m3 byte an element (k3_mla_prep.cu's build: each
+// landed bf16 to e4m3 by cvt.rn without saturation); the gather lifts a row back to bf16, exact.
+#ifdef KV_FP8
+#include <cuda_fp8.h>
+#include "k3_e4m3.cuh"
+typedef unsigned char kv_t;
+__device__ __forceinline__ unsigned fp8x2(unsigned w) {
+  const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w));
+  return e4m3x2_nosat(f.x, f.y);
+}
+__device__ __forceinline__ void put4(kv_t* p, uint2 v) { *reinterpret_cast<unsigned*>(p) = fp8x2(v.x) | fp8x2(v.y) << 16; }
+__device__ __forceinline__ unsigned bf16x2_of_e4m3x2(unsigned short x) {
+  const __half2 h = __half2(__nv_cvt_fp8x2_to_halfraw2(x, __NV_E4M3));
+  const __nv_bfloat162 b = __float22bfloat162_rn(__half22float2(h));
+  return *reinterpret_cast<const unsigned*>(&b);
+}
+// the 8 e4m3 elements at p as 8 bf16
+__device__ __forceinline__ uint4 get8(const kv_t* p) {
+  const uint2 v = *reinterpret_cast<const uint2*>(p);
+  return make_uint4(bf16x2_of_e4m3x2(v.x & 0xffffu), bf16x2_of_e4m3x2(v.x >> 16), bf16x2_of_e4m3x2(v.y & 0xffffu),
+                    bf16x2_of_e4m3x2(v.y >> 16));
+}
+#define PUT4(p, v) put4(p, v)
+#define GET8(p) get8(p)
+#else
+typedef bf16_t kv_t;
+#define PUT4(p, v) (*reinterpret_cast<uint2*>(p) = (v))
+#define GET8(p) (*reinterpret_cast<const uint4*>(p))
+#endif
 
 __device__ __forceinline__ unsigned pack2(float lo, float hi) {
   __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
@@ -72,7 +101,7 @@ __device__ __forceinline__ float landf(float x) { return __bfloat162float(__floa
 // latent row also written to `grow` unless null. The whole 512-thread block.
 __device__ __forceinline__ void prep_head(const bf16_t* __restrict__ partial, const bf16_t* __restrict__ gamma_q_a,
                                           const bf16_t* __restrict__ gamma_kv_a, const long long* __restrict__ slot_mapping,
-                                          bf16_t* __restrict__ slab, long long page_stride, bf16_t* __restrict__ q_norm,
+                                          kv_t* __restrict__ slab, long long page_stride, bf16_t* __restrict__ q_norm,
                                           bf16_t* __restrict__ grow, int b, int t) {
   __shared__ float red[NT / 32];
   const bf16_t* __restrict__ P = partial + (long long)b * MLA_FUSED;
@@ -90,7 +119,7 @@ __device__ __forceinline__ void prep_head(const bf16_t* __restrict__ partial, co
 
   const long long slot = slot_mapping[b];
   const bool append = (slot >= 0);
-  bf16_t* const row = slab + (slot / PAGE) * page_stride + (slot % PAGE) * KV_A;
+  kv_t* const row = slab + (slot / PAGE) * page_stride + (slot % PAGE) * KV_A;
   const bf16_t* const gsrc = isq ? (gamma_q_a + col) : (gamma_kv_a + (col - Q_LORA));
   const uint2 g = *reinterpret_cast<const uint2*>(gsrc);
   uint2 rope4 = make_uint2(0u, 0u);
@@ -114,11 +143,11 @@ __device__ __forceinline__ void prep_head(const bf16_t* __restrict__ partial, co
     *reinterpret_cast<uint2*>(q_norm + (long long)b * Q_LORA + col) = o;
     if (t < ROPE / 4) {
       if (grow) *reinterpret_cast<uint2*>(grow + KV_LORA + 4 * t) = rope4;
-      if (append) *reinterpret_cast<uint2*>(row + KV_LORA + 4 * t) = rope4;
+      if (append) PUT4(row + KV_LORA + 4 * t, rope4);
     }
   } else {
     if (grow) *reinterpret_cast<uint2*>(grow + (col - Q_LORA)) = o;
-    if (append) *reinterpret_cast<uint2*>(row + (col - Q_LORA)) = o;
+    if (append) PUT4(row + (col - Q_LORA), o);
   }
 }
 
@@ -134,7 +163,7 @@ __device__ __forceinline__ int seq_of(const int* __restrict__ cum_q, int nseq, i
 
 extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_prep(
     const bf16_t* __restrict__ partial, const bf16_t* __restrict__ gamma_q_a, const bf16_t* __restrict__ gamma_kv_a,
-    const long long* __restrict__ slot_mapping, bf16_t* __restrict__ slab, long long page_stride,
+    const long long* __restrict__ slot_mapping, kv_t* __restrict__ slab, long long page_stride,
     bf16_t* __restrict__ q_norm, const int* __restrict__ block_table, int max_pages, const int* __restrict__ lens,
     int ns, int nseq, bf16_t* __restrict__ latent_own, int* __restrict__ row_table, int* __restrict__ row_lens,
     int* __restrict__ bsk, int split_max, int short_max, int B) {
@@ -185,7 +214,7 @@ extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_prep(
 }
 
 extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_gather(
-    const bf16_t* __restrict__ slab, long long page_stride, const int* __restrict__ block_table, int max_pages,
+    const kv_t* __restrict__ slab, long long page_stride, const int* __restrict__ block_table, int max_pages,
     const int* __restrict__ lens, int ns, int nseq, bf16_t* __restrict__ latent_g, int w, int window, int n) {
   const int t = threadIdx.x;
   if (t >= GROWS * LANES) return;
@@ -201,8 +230,7 @@ extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_gather(
       int j = 0;
       while (j + 1 < nseq && cached[j + 1] <= s) ++j;
       const long long key = s - cached[j];
-      v[k] = *reinterpret_cast<const uint4*>(slab + block_table[j * max_pages + key / PAGE] * page_stride +
-                                             (key % PAGE) * KV_A + lane * 8);
+      v[k] = GET8(slab + block_table[j * max_pages + key / PAGE] * page_stride + (key % PAGE) * KV_A + lane * 8);
     }
   }
 #pragma unroll

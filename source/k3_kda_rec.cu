@@ -52,7 +52,21 @@
 #ifndef K12_LD  // partial's row stride: q | k | v | gate, then wsm when one projection made both
 #define K12_LD K12_FUSED
 #endif
-#define K12_REC_BYTES ((long long)HEADS * 128 * 128 * 4)
+// -DKDA_STATE_BF16=1: the recurrent state is stored bf16 (vLLM's mamba_ssm_cache_dtype bfloat16); it is
+// f32 in registers between tiles either way.
+#ifndef KDA_STATE_BF16
+#define KDA_STATE_BF16 0
+#endif
+#if KDA_STATE_BF16
+typedef __nv_bfloat16 rec_t;
+__device__ __forceinline__ float2 rec_ld(const rec_t* p) { return __bfloat1622float2(*(const __nv_bfloat162*)p); }
+__device__ __forceinline__ void rec_st(rec_t* p, float2 v) { *(__nv_bfloat162*)p = __float22bfloat162_rn(v); }
+#else
+typedef float rec_t;
+__device__ __forceinline__ float2 rec_ld(const rec_t* p) { return *(const float2*)p; }
+__device__ __forceinline__ void rec_st(rec_t* p, float2 v) { *(float2*)p = v; }
+#endif
+#define K12_REC_BYTES ((long long)HEADS * 128 * 128 * sizeof(rec_t))
 #define K12_WIN_BYTES ((long long)3 * K12_INNER * 2)
 #define K12_STAGES 8
 #define K12_OSTAGES 4
@@ -217,16 +231,16 @@ struct K12State {
   float2 a[8][4];
 };
 
-__device__ __forceinline__ void k12_recurrence(K12Smem& sm, const float* rec_in, float* rec_out, int len) {
+__device__ __forceinline__ void k12_recurrence(K12Smem& sm, const rec_t* rec_in, rec_t* rec_out, int len) {
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
   const int m = lane >> 3, r = lane & 7;
   K12State S;
   {
-    const float* row0 = rec_in + (size_t)(16 * w + g) * 128 + 2 * t;
+    const rec_t* row0 = rec_in + (size_t)(16 * w + g) * 128 + 2 * t;
 #pragma unroll
     for (int kb = 0; kb < 8; ++kb) {
-      const float2 a0 = *(const float2*)(row0 + 16 * kb), a1 = *(const float2*)(row0 + 8 * 128 + 16 * kb);
-      const float2 a2 = *(const float2*)(row0 + 16 * kb + 8), a3 = *(const float2*)(row0 + 8 * 128 + 16 * kb + 8);
+      const float2 a0 = rec_ld(row0 + 16 * kb), a1 = rec_ld(row0 + 8 * 128 + 16 * kb);
+      const float2 a2 = rec_ld(row0 + 16 * kb + 8), a3 = rec_ld(row0 + 8 * 128 + 16 * kb + 8);
       S.a[kb][0] = a0;
       S.a[kb][1] = a1;
       S.a[kb][2] = a2;
@@ -322,14 +336,14 @@ __device__ __forceinline__ void k12_recurrence(K12Smem& sm, const float* rec_in,
     __syncwarp();
     if (lane == 0) k12_arrive(&sm.ofull[o]);
   }
-  float* row0 = rec_out + (size_t)(16 * w + g) * 128 + 2 * t;
+  rec_t* row0 = rec_out + (size_t)(16 * w + g) * 128 + 2 * t;
 #pragma unroll
   for (int kb = 0; kb < 8; ++kb) {
     const float2* a = S.a[kb];
-    *(float2*)(row0 + 16 * kb) = a[0];
-    *(float2*)(row0 + 8 * 128 + 16 * kb) = a[1];
-    *(float2*)(row0 + 16 * kb + 8) = a[2];
-    *(float2*)(row0 + 8 * 128 + 16 * kb + 8) = a[3];
+    rec_st(row0 + 16 * kb, a[0]);
+    rec_st(row0 + 8 * 128 + 16 * kb, a[1]);
+    rec_st(row0 + 16 * kb + 8, a[2]);
+    rec_st(row0 + 8 * 128 + 16 * kb + 8, a[3]);
   }
 }
 
@@ -537,7 +551,7 @@ extern "C" __global__ void __launch_bounds__(K12_THREADS, 1) kern_k3_kda_rec(
   __syncthreads();
 
   if (warp < K12_MMA_WARPS) {
-    float* rec = (float*)(line + (long long)h * 128 * 128 * 4);
+    rec_t* rec = (rec_t*)(line + (long long)h * 128 * 128 * sizeof(rec_t));
     k12_recurrence(sm, rec, rec, len);
   } else if (warp == K12_MMA_WARPS || warp == K12_MMA_WARPS + 2) {
     const int which = warp == K12_MMA_WARPS ? 0 : 1;

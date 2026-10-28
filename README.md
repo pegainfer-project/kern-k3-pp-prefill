@@ -126,6 +126,14 @@ comparison are at commit
   `harness/p_fmha_window.cu` checks the passes against the plain causal
   call and an f32 reference and times them (8192 rows over 64k: +6%; over
   256k in 64k rounds: +0.8%; an empty round 17 µs).
+- The MLA cache is SGLang's fp8 one (`--kv fp8`, the default: e4m3 at
+  scale 1, cast as k3_mla_prep's append casts) on P and D alike, so a
+  prefill's pages hand to a decode tier as they are; the P lifts a round's
+  rows to bf16 for the expansion and keeps its own rows in bf16. Over fp8
+  pages a short call expands its context like any other (the absorbed
+  path is the bf16 DSL kernel's; `--kv bf16` keeps it). The KDA recurrent
+  state is stored bf16 (`--kda-state bf16`, the default) and computed f32
+  in both recurrence kernels; `--kda-state f32` is the f32 line.
 - Every layer has its own KV or KDA state, so `kern cut` splits the
   whole-model manifest into stages that carry only their own layers'
   states. A stage hands the next one the hidden stream and the
@@ -222,8 +230,9 @@ kern verify d-sglang.json
   `LINE_GUARD` skips SGLang's padded rows (slot -1). Without the two
   defines it builds to the pinned bytes; `harness/run.sh conv` checks the
   variant against the D build bit for bit.
-- Run it as SGLang's decode instance with `--tp-size 8 --dcp-size 8`,
-  `--kv-cache-dtype bf16`, `--mamba-ssm-dtype float32`, and
+- Generate the D for it with `--kv bf16 --kda-state f32` (SGLang's pools
+  as it runs them) and run it as SGLang's decode instance with
+  `--tp-size 8 --dcp-size 8`, `--kv-cache-dtype bf16`, `--mamba-ssm-dtype float32`, and
   `--max-running-requests` / `--cuda-graph-max-bs-decode` at most the
   manifest's 64. Prompts reach the cache through SGLang's P/D (the
   manifest has no prefill); a unified server takes one-token prompts only.

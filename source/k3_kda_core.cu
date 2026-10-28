@@ -186,6 +186,29 @@ typedef __nv_bfloat16 bf16;
 #define LDST(p) (*(p))
 #define STST(p, v) (*(p) = (v))
 #endif
+// -DKDA_STATE_BF16=1: rec is stored bf16 (vLLM's mamba_ssm_cache_dtype bfloat16) and computed f32, four k
+// values a lane's load either way (uint2 of bf16, float4 of f32); the same lane walk, half the bytes.
+#ifndef KDA_STATE_BF16
+#define KDA_STATE_BF16 0
+#endif
+#if KDA_STATE_BF16
+typedef uint2 rec_t;
+#define REC_SLICE (KD * KD * 2)
+__device__ __forceinline__ float4 rec_unpack(uint2 v) {
+  const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.x));
+  const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.y));
+  return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+__device__ __forceinline__ uint2 rec_pack(float4 f) {
+  const __nv_bfloat162 lo = __floats2bfloat162_rn(f.x, f.y), hi = __floats2bfloat162_rn(f.z, f.w);
+  return make_uint2(*reinterpret_cast<const unsigned*>(&lo), *reinterpret_cast<const unsigned*>(&hi));
+}
+#else
+typedef float4 rec_t;
+#define REC_SLICE (KD * KD * 4)
+__device__ __forceinline__ float4 rec_unpack(float4 v) { return v; }
+__device__ __forceinline__ float4 rec_pack(float4 f) { return f; }
+#endif
 
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
@@ -286,20 +309,20 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
 #if KDA_SMEM_STATE
   // The head's 64 KB state slice into shared memory by bulk copies, issued with the window's loads:
   // their round trip overlaps the whole prologue.
-  extern __shared__ __align__(128) float4 sh_rec[];
+  extern __shared__ __align__(128) rec_t sh_rec[];
   __shared__ __align__(8) unsigned long long rec_bar;
-  const char* rec_src = reinterpret_cast<const char*>(kda_base) + (long long)line_index[b] * line_bytes + (size_t)h * KD * KD * 4;
+  const char* rec_src = reinterpret_cast<const char*>(kda_base) + (long long)line_index[b] * line_bytes + (size_t)h * REC_SLICE;
   const unsigned bar = (unsigned)__cvta_generic_to_shared(&rec_bar);
   if (d == 0) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bar));
     asm volatile("fence.mbarrier_init.release.cluster;");
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(KD * KD * 4));
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(REC_SLICE));
   }
   __syncthreads();
   if (d < KDA_BULKN)  // a piece a thread: the copies issue side by side
     asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                 ::"r"((unsigned)__cvta_generic_to_shared(sh_rec) + d * (KD * KD * 4 / KDA_BULKN)),
-                 "l"(rec_src + d * (KD * KD * 4 / KDA_BULKN)), "r"(KD * KD * 4 / KDA_BULKN), "r"(bar) : "memory");
+                 ::"r"((unsigned)__cvta_generic_to_shared(sh_rec) + d * (REC_SLICE / KDA_BULKN)),
+                 "l"(rec_src + d * (REC_SLICE / KDA_BULKN)), "r"(REC_SLICE / KDA_BULKN), "r"(bar) : "memory");
 #endif
 #if KDA_CONV
   // the conv window (this row's cache line) and taps
@@ -308,7 +331,7 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
   bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(conv_base) + (long long)conv_index[b] * conv_bytes) + c;
 #else
   bf16* win = reinterpret_cast<bf16*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
-                                      (long long)HEADS * KD * KD * 4) + c;
+                                      (long long)HEADS * REC_SLICE) + c;
 #endif
   bf16 w[3][3];
   float k[3][4];
@@ -430,9 +453,8 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
   // ---- delta rule over rec ----
   const int kl = d & (KLANES - 1);   // 8 lanes over k
   const int dvl = d >> 3;            // 16 dv rows per pass
-  float* rec = reinterpret_cast<float*>(reinterpret_cast<char*>(kda_base) +
-                                        (long long)line_index[b] * line_bytes) +
-               (size_t)h * KD * KD;
+  rec_t* rec = reinterpret_cast<rec_t*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
+                                        (size_t)h * REC_SLICE);
 
   // dv-invariant coefficients for this lane's 16 k values: k = 32*j + 4*kl + i
   float cdec[KPER], ckn[KPER], cqs[KPER];
@@ -446,12 +468,12 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
     cqs[4 * j + 0] = e.x;  cqs[4 * j + 1] = e.y;  cqs[4 * j + 2] = e.z;  cqs[4 * j + 3] = e.w;
   }
 
-  float4* recv = reinterpret_cast<float4*>(rec) + kl;   // + dv*32 + 8*j
+  rec_t* recv = rec + kl;   // + dv*32 + 8*j
 #if KDA_SMEM_STATE
-  const float4* srcv = sh_rec + kl;
+  const rec_t* srcv = sh_rec + kl;
   asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n@!p bra W;\n}" ::"r"(bar) : "memory");
 #else
-  const float4* srcv = recv;
+  const rec_t* srcv = recv;
 #endif
 
 #pragma unroll 1
@@ -461,12 +483,12 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
 #pragma unroll
     for (int r = 0; r < ROWS_PER_ITER; ++r) {
       dv[r] = (it * ROWS_PER_ITER + r) * DVGRP + dvl;
-      const float4* p = srcv + (size_t)dv[r] * 32;
+      const rec_t* p = srcv + (size_t)dv[r] * 32;
 #pragma unroll
 #if KDA_SMEM_STATE
-      for (int j = 0; j < KVEC; ++j) s[r][j] = p[8 * j];
+      for (int j = 0; j < KVEC; ++j) s[r][j] = rec_unpack(p[8 * j]);
 #else
-      for (int j = 0; j < KVEC; ++j) s[r][j] = LDST(p + 8 * j);
+      for (int j = 0; j < KVEC; ++j) s[r][j] = rec_unpack(LDST(p + 8 * j));
 #endif
     }
 #pragma unroll
@@ -490,7 +512,7 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
       }
       const float dlt = (sh_v[dv[r]] - m) * beta;
       if (kl == 0) sh_attn[dv[r]] = fmaf(dlt, ckq, aq);
-      float4* p = recv + (size_t)dv[r] * 32;
+      rec_t* p = recv + (size_t)dv[r] * 32;
 #pragma unroll
       for (int j = 0; j < KVEC; ++j) {
         float4 o;
@@ -498,7 +520,7 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
         o.y = fmaf(dlt, ckn[4 * j + 1], s[r][j].y);
         o.z = fmaf(dlt, ckn[4 * j + 2], s[r][j].z);
         o.w = fmaf(dlt, ckn[4 * j + 3], s[r][j].w);
-        STST(p + 8 * j, o);
+        STST(p + 8 * j, rec_pack(o));
       }
     }
   }

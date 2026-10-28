@@ -287,3 +287,33 @@ defines = { BN = 32, CTA_KB = 73, SPLITS = 3 }
 sha256 = "928627f27ea4e05d04f4821042bb1cbbb9624867691fc6ca37f4d015f767599c"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 32, CTA_KB = 100, SPLITS = 3 }
+
+[kernels."k3_mla_glue+KV_FP8=1"]
+sha256 = "29ad75dc790738ba72ce4a96c854d904f37789571259dcd187f5d835763c4a50"
+source = "source/k3_mla_glue.cu"
+defines = { KV_FP8 = 1 }
+
+[kernels."k3_kda_rec+K12_LD=49408+KDA_STATE_BF16=1"]
+sha256 = "cb802ae088c58b76fdcd5e3062dda6993a4903ba3b17ba5498a2ac55cd7439da"
+source = "source/k3_kda_rec.cu"
+defines = { K12_LD = 49408, KDA_STATE_BF16 = 1 }
+
+[kernels."k3_kda_core+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+KDA_STATE_BF16=1+ROWS_PER_ITER=1"]
+sha256 = "405a797e35940174f4e9a63b2ec0373a1cd3d2a19bccd6927968241914aa2f12"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, KDA_STATE_BF16 = 1, ROWS_PER_ITER = 1 }
+
+[kernels."k3_kda_core+KDA_CONV=1+KDA_MINB=4+KDA_STATE_BF16=1+ROWS_PER_ITER=2"]
+sha256 = "b4c808e752c2fdee134b65b4defb5f0d540aceaa5bf8a8644ed0c8c874018ccb"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_MINB = 4, KDA_STATE_BF16 = 1, ROWS_PER_ITER = 2 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+KDA_STATE_BF16=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "bd270918c8c0a345c09c955dbb06a7c122cec7be30b93bc550ca972bb233c64f"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, KDA_STATE_BF16 = 1, LDS = 6400, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+KDA_STATE_BF16=1+LDS=6400+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "a5760df1ac0f2d7d9efc605d80a3e4f4f92a4fa140aed8a5e1b5b50b8ff04d46"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, KDA_STATE_BF16 = 1, LDS = 6400, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }
