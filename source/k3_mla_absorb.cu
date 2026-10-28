@@ -43,10 +43,6 @@
 #define OCT (CS / 8)  // 8-column octets per slice
 
 // -DQBF16: the query arrives landed (bf16 [B, HEADS*192], a prefill's q_b GEMM output): the same qh.
-// The prefill launches it for B <= 512 rows with the FMHA's tables (k3_fmha_plan.cuh, ns words a
-// row): past short_max rows there is no absorbed attention, and the blocks instead copy a split
-// sequence's q rows (Lq from row q0) to the FMHA pieces' rows B + Lq - 1 - i (reversed) and B + Lq + i,
-// block (bt, h, cs) rows bt * 32 + cs * 4 .. +4 of head h.
 #ifdef QBF16
 typedef __nv_bfloat16 q_t;
 __device__ __forceinline__ float qf(q_t x) { return __bfloat162float(x); }
@@ -57,24 +53,7 @@ __device__ __forceinline__ float qf(q_t x) { return x; }
 
 extern "C" __global__ void __launch_bounds__(128) kern_k3_mla_absorb(const q_t* __restrict__ q_partial,
                                                                     const __nv_bfloat16* __restrict__ w_kv_b,
-                                                                    __nv_bfloat16* __restrict__ q_abs, int B
-#ifdef QBF16
-                                                                    , const int* __restrict__ lens, int ns, int short_max
-#endif
-) {
-#ifdef QBF16
-  if (B > short_max) {
-    const int* __restrict__ rec = lens + 3 * ns;
-    const int lq = rec[3], i = blockIdx.x * 32 + blockIdx.z * 4 + threadIdx.x / (QW / 8), e = threadIdx.x % (QW / 8);
-    if (threadIdx.x >= 4 * (QW / 8) || i >= lq) return;
-    q_t* __restrict__ q = const_cast<q_t*>(q_partial);
-    const size_t col = (size_t)blockIdx.y * QW + e * 8;
-    const uint4 v = *reinterpret_cast<const uint4*>(q + (size_t)(rec[2] + i) * (HEADS * QW) + col);
-    *reinterpret_cast<uint4*>(q + (size_t)(B + lq - 1 - i) * (HEADS * QW) + col) = v;
-    *reinterpret_cast<uint4*>(q + (size_t)(B + lq + i) * (HEADS * QW) + col) = v;
-    return;
-  }
-#endif
+                                                                    __nv_bfloat16* __restrict__ q_abs, int B) {
   __shared__ __nv_bfloat16 qh[RB][QW];
   __shared__ float red[KS][RB][CS];
   const int h = blockIdx.y, c0 = blockIdx.z * CS, t = threadIdx.x;

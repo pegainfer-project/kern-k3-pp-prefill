@@ -1,37 +1,40 @@
-// The glue of a packed prefill chunk's MLA layer around TensorRT-LLM's
-// context FMHA, two launches where there were three:
+// The glue of a packed prefill chunk's MLA layer around TensorRT-LLM's context FMHA, whose rows attend
+// their own rows through the causal kernel and their sequences' cached context through its dense
+// sibling in rounds of `window` keys (k3_fmha_plan.cuh), the pieces merged by the kernels' softmax stats:
 //
-//   kern_k3g_mla_prep_gather(partial, gamma_q_a, gamma_kv_a, slot_mapping, slab, page_stride, q_norm,
-//                            block_table, max_pages, lens, ns, nseq, latent_g, n, B)
-//     blocks [0, B): k3_mla_prep.cu's head for chunk row b (q_norm, the latent row kv_norm | rope
-//       appended to the slab), the latent row also written to its place in latent_g;
-//     blocks [B, B + ceil(n / 28)): rows [28 g, 28 g + 28) of latent_g, the sequences' cached latent
-//       rows back to back (sequence j's at [cum_kv[j], cum_kv[j] + seq_lens_kv[j])), every other row
-//       of the first n zero; the rows this chunk appends are the head blocks' own.
+//   kern_k3g_mla_prep(partial, gamma_q_a, gamma_kv_a, slot_mapping, slab, page_stride, q_norm, block_table,
+//                     max_pages, lens, ns, nseq, latent_own, row_table, row_lens, bsk, split_max, short_max, B)
+//     blocks [0, B): k3_mla_prep.cu's head for chunk row b (q_norm, the latent row kv_norm | rope appended to
+//       the slab), the latent row also written to row b of latent_own, the chunk's own keys in row order;
+//       rows [B, B + 128) of latent_own zero, the FMHA's tile past the last sequence's end.
+//     blocks [B, 2B + 1): a short chunk's (B <= short_max) rows for the absorbed attention (k3_mla_absorb →
+//       FlashInfer's MLA decode → k3_mla_vup_gate) instead of the expansion + FMHA: row b's page table row
+//       (its sequence's) and causal length (the cached rows, the chunk's rows up to b), then block 2B
+//       k3_mla_split_plan.cu's KV split plan over those lengths. A long chunk's head blocks skip latent_own.
 //     partial bf16 [B, MLA_FUSED] the fused projection (q_a | kv_a | rope | gate), landed by its GEMM;
-//     slab, page_stride: the layer's latent pages; lens: kern_k3_fmha_lens_varlen's tables
-//     (seq_lens_kv | cum_q | cum_kv, ns words each) of the call's nseq + 2 FMHA sequences and its
-//     split record. A split sequence's rows go to its pieces: keys c + 1 .. in its own span, keys
-//     c .. 1 and 0 .. Lq - 1 in the two spans past the last sequence's (its q rows are copied after
-//     q_b by k3_mla_absorb.cu's -DQBF16 launch).
-//   grid (B + ceil(n / 28), 1, 1)   block (512, 1, 1)
-//
-//   kern_k3g_mla_prep_rows(partial, gamma_q_a, gamma_kv_a, slot_mapping, slab, page_stride, q_norm,
-//                          block_table, max_pages, lens, ns, nseq, row_table, row_lens, bsk, split_max, B)
-//     a short chunk's form, for the absorbed attention (k3_mla_absorb → FlashInfer's MLA decode →
-//     k3_mla_vup_gate) instead of the expansion + FMHA: blocks [0, B) the head without latent_g;
-//     blocks [B, 2B) row b's page table row (its sequence's) and causal length (the cached rows, the
-//     chunk's rows up to b); block 2B k3_mla_split_plan.cu's KV split plan over those lengths.
+//     slab, page_stride: the layer's latent pages; lens: the FMHA tables (k3_fmha_plan.cuh, ns words a row).
 //   grid (2 B + 1, 1, 1)   block (512, 1, 1)
 //
-//   kern_k3g_mla_gate(out, o, partial, ..., stats, lens, ns, n, short_max, B)
-//     sigmoid_mul.cu's kern_sigmoid_mul_bf16 on the gate columns of the fused projection:
-//     out = bf16(o * bf16(sigmoid(bf16(partial[b, HEADC + j])))), o / out [B, n]. A split sequence's
-//     row first merges its three pieces' o through the FMHA's (max, sum) stats.
+//   kern_k3g_mla_gather(slab, page_stride, block_table, max_pages, lens, ns, nseq, latent_g, w, window, n)
+//     rows [0, n) of latent_g: round w's keys, the sequences' cached latent rows [w window, w window + n) of
+//     the stream (set 0's aux row: sequence j's keys at [C_j, C_j + P_j)), every row past the stream's end
+//     zero. GITER rows a thread in flight, 28 a block.
+//   grid (ceil(n / 28), 1, 1)   block (512, 1, 1)
+//
+//   kern_k3g_mla_merge(o, stats, lens, ns, nseq, acc_o, acc_ms, init, n, B)
+//     one FMHA pass's partial (o bf16 [B, n], stats float2 (max, sum) per row and head) folded into the
+//     f32 accumulator (acc_o [B, n], acc_ms float2 per row and head) for the rows whose sequence had keys
+//     in it (lens: the pass's set): acc = acc e^(m - m') + s_p e^(m_p - m') o_p, likewise the sum, m' the
+//     new max; `init` (the own pass, every row's first) takes the partial as is. 8 columns a thread.
+//   grid (B n / 2048, 1, 1)   block (256, 1, 1)
+//
+//   kern_k3g_mla_gate(out, acc_o, partial, ..., acc_ms, n, short_max, B)
+//     sigmoid_mul.cu's kern_sigmoid_mul_bf16 on the gate columns of the fused projection over the merged
+//     attention: out = bf16(bf16(acc_o / s) * bf16(sigmoid(bf16(partial[b, HEADC + j])))), out [B, n].
 //   grid (ceil(B / 8) * n / 2048 + the absorbed form's blocks, 1, 1)   block (256, 1, 1)
 //
-// Every value is the three kernels' bit for bit (the same landings, sums and roundings), but a split
-// row's o: an f32 merge of three bf16 pieces.
+// Every value is k3_mla_prep's and sigmoid_mul's bit for bit (the same landings, sums and roundings);
+// the attention's o is an f32 merge of bf16 pieces, bf16-landed once.
 #include <cuda_bf16.h>
 
 #define Q_LORA 1536
@@ -120,96 +123,91 @@ __device__ __forceinline__ void prep_head(const bf16_t* __restrict__ partial, co
 }
 
 #define TILE_KV 128  // the decode attention's KV tile (k3_mla_split_plan.cu)
+#define KV_PAD 128   // the FMHA's KV tile: rows past the last sequence's end it reads, zero
 
-extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_prep_gather(
+// row b's sequence among nseq (cum_q: the set's cum_seq_lens_q row)
+__device__ __forceinline__ int seq_of(const int* __restrict__ cum_q, int nseq, int b) {
+  int j = 0;
+  while (j + 1 < nseq && cum_q[j + 1] <= b) ++j;
+  return j;
+}
+
+extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_prep(
     const bf16_t* __restrict__ partial, const bf16_t* __restrict__ gamma_q_a, const bf16_t* __restrict__ gamma_kv_a,
     const long long* __restrict__ slot_mapping, bf16_t* __restrict__ slab, long long page_stride,
     bf16_t* __restrict__ q_norm, const int* __restrict__ block_table, int max_pages, const int* __restrict__ lens,
-    int ns, int nseq, bf16_t* __restrict__ latent_g, int n, int* __restrict__ row_table, int* __restrict__ row_lens,
+    int ns, int nseq, bf16_t* __restrict__ latent_own, int* __restrict__ row_table, int* __restrict__ row_lens,
     int* __restrict__ bsk, int split_max, int short_max, int B) {
   const int t = threadIdx.x;
   const int* __restrict__ cum_q = lens + ns;
-  const int* __restrict__ cum_kv = lens + 2 * ns;
-  const int* __restrict__ rec = lens + 3 * ns;
-  const int slq = rec[3], split = slq > 0 ? rec[0] : -1, sc = rec[1], sq0 = rec[2], sp = rec[4];
+  const int* __restrict__ cached = lens + 3 * ns;  // set 0's aux: the cached-key prefix sums
   const bool absorbed = B <= short_max;
-  const auto seq_of = [&](int b) {
-    int j = 0;
-    while (j + 1 < nseq && cum_q[j + 1] <= b) ++j;
-    return j;
-  };
   // row b of sequence j: its place among the sequence's rows (the cached ones first), its causal length
-  const auto pos_of = [&](int b, int j) { return lens[j] - (cum_q[j + 1] - cum_q[j]) + (b - cum_q[j]); };
+  const auto pos_of = [&](int b, int j) { return cached[j + 1] - cached[j] + (b - cum_q[j]); };
 
-  if (blockIdx.x < B) {  // ---- head: q_norm, kv_norm, rope, the latent row (also to latent_g for the expansion)
-    const int b = blockIdx.x, j = seq_of(b), i = b - sq0;
-    if (j == split)  // its chunk rows are keys sp + i of piece N, which starts at key c + 1
-      prep_head(partial, gamma_q_a, gamma_kv_a, slot_mapping, slab, page_stride, q_norm,
-                latent_g + (long long)(cum_kv[j] + sp + i - sc - 1) * KV_A, b, t);
-    else
-      prep_head(partial, gamma_q_a, gamma_kv_a, slot_mapping, slab, page_stride, q_norm,
-                absorbed ? nullptr : latent_g + (long long)(cum_kv[j] + pos_of(b, j)) * KV_A, b, t);
+  if (blockIdx.x < B) {  // ---- head: q_norm, kv_norm, rope, the latent row (also to latent_own for the expansion)
+    const int b = blockIdx.x;
+    prep_head(partial, gamma_q_a, gamma_kv_a, slot_mapping, slab, page_stride, q_norm,
+              absorbed ? nullptr : latent_own + (long long)b * KV_A, b, t);
+    if (!absorbed && b < KV_PAD && t < LANES)
+      *reinterpret_cast<uint4*>(latent_own + (long long)(B + b) * KV_A + t * 8) = make_uint4(0, 0, 0, 0);
     return;
   }
-  if (blockIdx.x < 2 * B + 1) {  // ---- a short chunk's rows for the absorbed attention
-    if (!absorbed) return;
-    if (blockIdx.x < 2 * B) {  // row b's page table (its sequence's pages) and causal length
-      const int b = blockIdx.x - B, j = seq_of(b), len = pos_of(b, j) + 1;
-      for (int p = t; p < (len + PAGE - 1) / PAGE; p += NT) row_table[b * max_pages + p] = block_table[j * max_pages + p];
-      if (t == 0) row_lens[b] = len;
-      return;
-    }
-    // k3_mla_split_plan.cu's KV split plan over those lengths
-    __shared__ long long wsum[NT / 32];
-    const int warp = t >> 5, lane = t & 31;
-    long long mine = 0;
-    for (int b = t; b < B; b += NT) mine += (pos_of(b, seq_of(b)) + TILE_KV) / TILE_KV;
-#pragma unroll
-    for (int o = 16; o; o >>= 1) mine += __shfl_xor_sync(0xffffffffu, mine, o);
-    if (lane == 0) wsum[warp] = mine;
-    __syncthreads();
-    long long total = 0;
-#pragma unroll
-    for (int w = 0; w < NT / 32; ++w) total += wsum[w];
-    unsigned nsm;
-    asm("mov.u32 %0, %%nsmid;" : "=r"(nsm));
-    long long budget = nsm / 2 - B;
-    if (budget < 1) budget = 1;
-    long long per = (total + budget - 1) / budget;
-    if (per < 1) per = 1;
-    for (int b = t; b < B; b += NT) {
-      const long long tiles = (pos_of(b, seq_of(b)) + TILE_KV) / TILE_KV;
-      bsk[b] = (int)min(max((tiles + per - 1) / per, 1ll), (long long)split_max);
-    }
+  if (!absorbed) return;  // ---- a short chunk's rows for the absorbed attention
+  if (blockIdx.x < 2 * B) {  // row b's page table (its sequence's pages) and causal length
+    const int b = blockIdx.x - B, j = seq_of(cum_q, nseq, b), len = pos_of(b, j) + 1;
+    for (int p = t; p < (len + PAGE - 1) / PAGE; p += NT) row_table[b * max_pages + p] = block_table[j * max_pages + p];
+    if (t == 0) row_lens[b] = len;
     return;
   }
-  // ---- gather: the context's cached latent rows for the expansion, GITER of them a thread in flight
-  if (absorbed || t >= GROWS * LANES) return;
-  const int lane = t % LANES, r0 = (blockIdx.x - 2 * B - 1) * GROWS * GITER + t / LANES;
+  // k3_mla_split_plan.cu's KV split plan over those lengths
+  __shared__ long long wsum[NT / 32];
+  const int warp = t >> 5, lane = t & 31;
+  long long mine = 0;
+  for (int b = t; b < B; b += NT) mine += (pos_of(b, seq_of(cum_q, nseq, b)) + TILE_KV) / TILE_KV;
+#pragma unroll
+  for (int o = 16; o; o >>= 1) mine += __shfl_xor_sync(0xffffffffu, mine, o);
+  if (lane == 0) wsum[warp] = mine;
+  __syncthreads();
+  long long total = 0;
+#pragma unroll
+  for (int w = 0; w < NT / 32; ++w) total += wsum[w];
+  unsigned nsm;
+  asm("mov.u32 %0, %%nsmid;" : "=r"(nsm));
+  long long budget = nsm / 2 - B;
+  if (budget < 1) budget = 1;
+  long long per = (total + budget - 1) / budget;
+  if (per < 1) per = 1;
+  for (int b = t; b < B; b += NT) {
+    const long long tiles = (pos_of(b, seq_of(cum_q, nseq, b)) + TILE_KV) / TILE_KV;
+    bsk[b] = (int)min(max((tiles + per - 1) / per, 1ll), (long long)split_max);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_gather(
+    const bf16_t* __restrict__ slab, long long page_stride, const int* __restrict__ block_table, int max_pages,
+    const int* __restrict__ lens, int ns, int nseq, bf16_t* __restrict__ latent_g, int w, int window, int n) {
+  const int t = threadIdx.x;
+  if (t >= GROWS * LANES) return;
+  const int* __restrict__ cached = lens + 3 * ns;
+  const long long total = cached[nseq], base = (long long)w * window;
+  const int lane = t % LANES, r0 = blockIdx.x * GROWS * GITER + t / LANES;
   uint4 v[GITER];
-  bool put[GITER];
 #pragma unroll
   for (int k = 0; k < GITER; ++k) {
-    const int r = r0 + k * GROWS;
+    const long long s = base + r0 + k * GROWS;
     v[k] = make_uint4(0, 0, 0, 0);
-    put[k] = false;
-    if (r < n) {
-      int z = 0;
-      while (z + 1 < nseq + 2 && cum_kv[z + 1] <= r) ++z;
-      const int local = r - cum_kv[z];
-      // the piece's sequence and key: its own span, or the split's N (from key c + 1), R (c down), A (0 up)
-      const int j = z < nseq ? z : split;
-      const int key = z == split ? local + sc + 1 : z == nseq ? sc - local : local;
-      const int cached = z == split || z >= nseq ? sp : lens[z] - (cum_q[z + 1] - cum_q[z]);
-      put[k] = local >= lens[z] || key < cached;  // this chunk's rows: its head blocks write them
-      if (local < lens[z] && key < cached)
-        v[k] = *reinterpret_cast<const uint4*>(slab + block_table[j * max_pages + key / PAGE] * page_stride +
-                                               (long long)(key % PAGE) * KV_A + lane * 8);
+    if (r0 + k * GROWS < n && s < total) {
+      int j = 0;
+      while (j + 1 < nseq && cached[j + 1] <= s) ++j;
+      const long long key = s - cached[j];
+      v[k] = *reinterpret_cast<const uint4*>(slab + block_table[j * max_pages + key / PAGE] * page_stride +
+                                             (key % PAGE) * KV_A + lane * 8);
     }
   }
 #pragma unroll
   for (int k = 0; k < GITER; ++k)
-    if (put[k]) *reinterpret_cast<uint4*>(latent_g + (long long)(r0 + k * GROWS) * KV_A + lane * 8) = v[k];
+    if (r0 + k * GROWS < n) *reinterpret_cast<uint4*>(latent_g + (long long)(r0 + k * GROWS) * KV_A + lane * 8) = v[k];
 }
 
 // k3_mla_vup_gate.cu's kernel as the absorbed form's blocks: the attention's latent output through W_UV,
@@ -348,32 +346,29 @@ __device__ __forceinline__ void vup_gate_block(const float* __restrict__ acc_o, 
 }
 
 
-// a split row's three pieces' o (N at row b, R at B + Lq - 1 - i, A at B + Lq + i) merged through the
-// FMHA's stats, landed to bf16
-__device__ __forceinline__ uint4 merge_split(const bf16_t* __restrict__ o, const float2* __restrict__ stats,
-                                             const int* __restrict__ rec, long long b, int j, int n, int B) {
-  const int i = (int)b - rec[2], lq = rec[3], h = j / NOPE;
-  const long long rows[3] = {b, B + lq - 1 - i, B + lq + i};
-  float2 st[3];
-  float m = -__int_as_float(0x7f800000);
-#pragma unroll
-  for (int k = 0; k < 3; ++k) st[k] = stats[rows[k] * (n / NOPE) + h], m = fmaxf(m, st[k].x);
-  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}, den = 0.f;
-#pragma unroll
-  for (int k = 0; k < 3; ++k) {
-    const float w = st[k].y * expf(st[k].x - m);
-    const uint4 pv = *reinterpret_cast<const uint4*>(o + rows[k] * n + j);
-    const __nv_bfloat162* pp = reinterpret_cast<const __nv_bfloat162*>(&pv);
-    den += w;
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-      const float2 f = __bfloat1622float2(pp[e]);
-      acc[2 * e] = fmaf(w, f.x, acc[2 * e]), acc[2 * e + 1] = fmaf(w, f.y, acc[2 * e + 1]);
-    }
-  }
-  const float inv = 1.f / den;
-  return make_uint4(pack2(acc[0] * inv, acc[1] * inv), pack2(acc[2] * inv, acc[3] * inv),
-                    pack2(acc[4] * inv, acc[5] * inv), pack2(acc[6] * inv, acc[7] * inv));
+#define NEG_INF (-__int_as_float(0x7f800000))
+
+extern "C" __global__ void __launch_bounds__(256) kern_k3g_mla_merge(
+    const bf16_t* __restrict__ o, const float2* __restrict__ stats, const int* __restrict__ lens, int ns, int nseq,
+    float* __restrict__ acc_o, float2* __restrict__ acc_ms, int init, int n, int B) {
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int b = (int)(i / (n / 8)), c = (int)(i % (n / 8)) * 8, h = c / NOPE;
+  if (b >= B || lens[seq_of(lens + ns, nseq, b)] == 0) return;
+  const float2 st = stats[(long long)b * HEADS + h];
+  const float2 prev = init ? make_float2(NEG_INF, 0.f) : acc_ms[(long long)b * HEADS + h];
+  const float m = fmaxf(prev.x, st.x), wa = init ? 0.f : expf(prev.x - m), wp = st.y * expf(st.x - m);
+  float* __restrict__ a = acc_o + (long long)b * n + c;
+  const uint4 pv = *reinterpret_cast<const uint4*>(o + (long long)b * n + c);
+  const __nv_bfloat162* pp = reinterpret_cast<const __nv_bfloat162*>(&pv);
+  float4 x = init ? make_float4(0.f, 0.f, 0.f, 0.f) : *reinterpret_cast<const float4*>(a);
+  float4 y = init ? make_float4(0.f, 0.f, 0.f, 0.f) : *reinterpret_cast<const float4*>(a + 4);
+  const float2 p0 = __bfloat1622float2(pp[0]), p1 = __bfloat1622float2(pp[1]), p2 = __bfloat1622float2(pp[2]),
+               p3 = __bfloat1622float2(pp[3]);
+  x = make_float4(fmaf(wp, p0.x, x.x * wa), fmaf(wp, p0.y, x.y * wa), fmaf(wp, p1.x, x.z * wa), fmaf(wp, p1.y, x.w * wa));
+  y = make_float4(fmaf(wp, p2.x, y.x * wa), fmaf(wp, p2.y, y.y * wa), fmaf(wp, p3.x, y.z * wa), fmaf(wp, p3.y, y.w * wa));
+  *reinterpret_cast<float4*>(a) = x;
+  *reinterpret_cast<float4*>(a + 4) = y;
+  if (c % NOPE == 0) acc_ms[(long long)b * HEADS + h] = make_float2(m, prev.y * wa + wp);
 }
 
 // GATE_ROWS rows a thread, every load issued before the first use: the kernel's registers and shared
@@ -422,22 +417,26 @@ __device__ __forceinline__ bool gate_ok(const uint4& gv) {
   return ok;
 }
 
-// rows b0 .. b0 + GATE_ROWS of columns j .. j + 8. A warp's whole tile without a split row and with
-// every x in rcp_fast's range runs as straight-line code: no division branch to keep its rows apart.
-__device__ __forceinline__ void gate_rows(bf16_t* __restrict__ out, const bf16_t* __restrict__ o,
-                                          const bf16_t* __restrict__ partial, const float2* __restrict__ stats,
-                                          const int* __restrict__ lens, int ns, int n, int B) {
+// rows b0 .. b0 + GATE_ROWS of columns j .. j + 8, the merged attention landed to bf16. A warp's whole
+// tile with every x in rcp_fast's range runs as straight-line code: no division branch to keep its
+// rows apart.
+__device__ __forceinline__ void gate_rows(bf16_t* __restrict__ out, const float* __restrict__ acc_o,
+                                          const float2* __restrict__ acc_ms, const bf16_t* __restrict__ partial,
+                                          int n, int B) {
   const long long b0 = (long long)(blockIdx.x / (n / 2048)) * GATE_ROWS;
-  const int j = (blockIdx.x % (n / 2048) * blockDim.x + threadIdx.x) * 8;
+  const int j = (blockIdx.x % (n / 2048) * blockDim.x + threadIdx.x) * 8, h = j / NOPE;
   uint4 gv[GATE_ROWS], av[GATE_ROWS];
 #pragma unroll
   for (int r = 0; r < GATE_ROWS; ++r)
     if (b0 + r < B) {
       gv[r] = *reinterpret_cast<const uint4*>(partial + (b0 + r) * MLA_FUSED + HEADC + j);
-      av[r] = *reinterpret_cast<const uint4*>(o + (b0 + r) * n + j);
+      const float inv = 1.f / acc_ms[(b0 + r) * HEADS + h].y;
+      const float4 x = *reinterpret_cast<const float4*>(acc_o + (b0 + r) * n + j);
+      const float4 y = *reinterpret_cast<const float4*>(acc_o + (b0 + r) * n + j + 4);
+      av[r] = make_uint4(pack2(x.x * inv, x.y * inv), pack2(x.z * inv, x.w * inv), pack2(y.x * inv, y.y * inv),
+                         pack2(y.z * inv, y.w * inv));
     }
-  const int* __restrict__ rec = lens + 3 * ns;
-  bool ok = b0 + GATE_ROWS <= B && (rec[3] == 0 || b0 + GATE_ROWS <= rec[2] || b0 >= rec[2] + rec[3]);
+  bool ok = b0 + GATE_ROWS <= B;
 #pragma unroll
   for (int r = 0; r < GATE_ROWS; ++r) ok = ok && gate_ok(gv[r]);
   if (__all_sync(0xffffffffu, ok)) {
@@ -449,24 +448,23 @@ __device__ __forceinline__ void gate_rows(bf16_t* __restrict__ out, const bf16_t
   for (int r = 0; r < GATE_ROWS; ++r) {
     const long long b = b0 + r;
     if (b >= B) break;
-    if (rec[3] > 0 && b >= rec[2] && b < rec[2] + rec[3]) av[r] = merge_split(o, stats, rec, b, j, n, B);
     *reinterpret_cast<uint4*>(out + b * n + j) = gate8<false>(gv[r], av[r]);
   }
 }
 
 extern "C" __global__ void __launch_bounds__(256) kern_k3g_mla_gate(
-    bf16_t* __restrict__ out, const bf16_t* __restrict__ o, const bf16_t* __restrict__ partial,
-    const float* __restrict__ acc_o, const float* __restrict__ acc_lse, const int* __restrict__ row_lens,
-    const int* __restrict__ bsk, int split_max, const bf16_t* __restrict__ w_kv_b, const float2* __restrict__ stats,
-    const int* __restrict__ lens, int ns, int n, int short_max, int B) {
+    bf16_t* __restrict__ out, const float* __restrict__ acc_o, const bf16_t* __restrict__ partial,
+    const float* __restrict__ s_acc_o, const float* __restrict__ s_acc_lse, const int* __restrict__ row_lens,
+    const int* __restrict__ bsk, int split_max, const bf16_t* __restrict__ w_kv_b, const float2* __restrict__ acc_ms,
+    int n, int short_max, int B) {
   const int gate_blocks = (B + GATE_ROWS - 1) / GATE_ROWS * (n / 2048);
   if (B <= short_max) {  // a short chunk: o_lat through W_UV, then the gate (blocks past the gate's)
     if (blockIdx.x < gate_blocks) return;
     const int i = blockIdx.x - gate_blocks;
-    vup_gate_block(acc_o, acc_lse, row_lens, bsk, split_max, w_kv_b, partial, out, B, i / (HEADS * 4), i / 4 % HEADS,
+    vup_gate_block(s_acc_o, s_acc_lse, row_lens, bsk, split_max, w_kv_b, partial, out, B, i / (HEADS * 4), i / 4 % HEADS,
                    i % 4);
     return;
   }
   if (blockIdx.x >= gate_blocks) return;
-  gate_rows(out, o, partial, stats, lens, ns, n, B);
+  gate_rows(out, acc_o, acc_ms, partial, n, B);
 }

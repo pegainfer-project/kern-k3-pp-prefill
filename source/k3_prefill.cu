@@ -61,11 +61,11 @@ extern "C" __global__ void kern_k3_fmha_lens(const int* __restrict__ seq_lens, i
   lens[7] = 0;
 }
 
-// `kern_k3_fmha_lens_varlen`: k3_fmha_plan.cuh's tables for a packed call of
-// `n` sequences.
+// `kern_k3_fmha_lens_varlen`: k3_fmha_plan.cuh's tables for a packed call of `n` sequences, the own
+// set and `nw` round sets of `window` rows, a thread each.
 //   grid (1, 1, 1)   block (32, 1, 1)
 extern "C" __global__ void kern_k3_fmha_lens_varlen(const int* __restrict__ seq_lens,
                                                     const long long* __restrict__ cu_q, int* __restrict__ lens, int n,
-                                                    int ns, int short_max) {
-  if (threadIdx.x == 0) fmha_plan(seq_lens, cu_q, lens, n, ns, short_max);
+                                                    int ns, int short_max, int window, int nw) {
+  for (int k = threadIdx.x; k <= nw; k += blockDim.x) fmha_plan_set(seq_lens, cu_q, lens, n, ns, k, window, short_max);
 }

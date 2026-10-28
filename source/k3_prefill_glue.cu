@@ -336,7 +336,7 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_attnres_rms(
 // snapshot 0 are the embedding row, normed its rms by gamma.
 // A stage's setup rides along in its first launch: the MoE routing state (k3_moe_route.cu's barrier and
 // tables) zeroed, each block its share of the `words`, and for the packed prefill's stage 0 the FMHA's
-// length tables (k3_fmha_plan.cuh) by block 0.
+// length tables (k3_fmha_plan.cuh, the own set and nw round sets) by block 0.
 __device__ __forceinline__ void zero_share(unsigned* __restrict__ p, int words, int B, int t) {
   const int per = (words + B - 1) / B, lo = blockIdx.x * per, hi = min(lo + per, words);
   for (int i = lo + t; i < hi; i += blockDim.x) p[i] = 0u;
@@ -346,14 +346,15 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_embed_rms(
     const long long* __restrict__ ids, const bf16_t* __restrict__ table, bf16_t* __restrict__ hidden,
     bf16_t* __restrict__ blocks, const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed,
     const int* __restrict__ seq_lens, const long long* __restrict__ cu_q, int* __restrict__ lens, int nseq, int ns,
-    int short_max, unsigned* __restrict__ sync, int sync_words, int B) {
+    int short_max, int window, int nw, unsigned* __restrict__ sync, int sync_words, int B) {
   __shared__ RowSmem s;
   const int b = blockIdx.x;
   if (b >= B) return;
   const int t = threadIdx.x;
   zero_pads(s, t);
   zero_share(sync, sync_words, B, t);
-  if (b == 0 && t == 0) fmha_plan(seq_lens, cu_q, lens, nseq, ns, short_max);
+  if (b == 0)
+    for (int k = t; k <= nw; k += blockDim.x) fmha_plan_set(seq_lens, cu_q, lens, nseq, ns, k, window, short_max);
 
   const bf16_t* __restrict__ row = table + ids[b] * KH;
   V8 pv[RGROUPS];

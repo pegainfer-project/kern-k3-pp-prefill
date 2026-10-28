@@ -84,15 +84,15 @@ sha256 = "6b4d144e735a4b08d29bf8d6e302107a4d1396a6967b0b6d342fe263ff6c8bca"
 source = "source/k3_moe_prefill.cu"
 
 [kernels."k3_prefill"]
-sha256 = "7673000effd0d10f37dfdecc66e5a962ee699497d517a837fdd0fb06b177ce4d"
+sha256 = "8145127fb97b8eeaf18c8cc0ede00ae06e224d0c951734c66f4128e3bef67a92"
 source = "source/k3_prefill.cu"
 
 [kernels."k3_prefill_glue"]
-sha256 = "94cb4e596075d1ccd977403dcd0f7d2a2ba0b423bfd6c050fa972dd569acfb60"
+sha256 = "1253149942a224a0642119d31aa6da72848e3f1e38692c99a5346501d1616b6f"
 source = "source/k3_prefill_glue.cu"
 
 [kernels."k3_prefill_glue+EXPERTS=896"]
-sha256 = "267766a767f7bf308df84f4eaa11efd029a2e166143aeb26b3376ef0b42b3342"
+sha256 = "1bce46950b3ec4e36a1a923fb0dbf86b8509bb95b72056ff7b757da39f583353"
 source = "source/k3_prefill_glue.cu"
 defines = { EXPERTS = 896 }
 
@@ -118,6 +118,11 @@ source = "source/k3_weight_prep.cu"
 sha256 = "240811d976c01e4a9bee00041d98343f6f9254fefae598df46a97ff07c7df508"
 prebuilt = "prebuilt/trtllm_fmha_ctx_h192_v128.cubin"
 upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvBfloat16OBfloat16HQk192HV128SeparateQkvCausalVarSeqQ256Kv128PersistentContext.cubin"
+
+[kernels."trtllm_fmha_dense_h192_v128"]
+sha256 = "6a471f0ff4f8ffae55e48e64c07001ee80fb5bee604269d4814106e9baa98955"
+prebuilt = "prebuilt/trtllm_fmha_dense_h192_v128.cubin"
+upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvBfloat16OBfloat16HQk192HV128SeparateQkvDenseVarSeqQ256Kv128PersistentContext.cubin"
 
 [kernels."weight_prep"]
 sha256 = "040f51b01c421b9c69a2090034ff1bc4741e40c02f5ea52bd04a3e62e5c1af4d"
@@ -211,11 +216,11 @@ sha256 = "a8bf7838ec883196b7edfeffaa5f9323533452f7e00dc1502b24da39648b074d"
 source = "source/k3_moe_route.cu"
 
 [kernels."k3_mla_glue"]
-sha256 = "2c513081b5cb4f48e3f416ea7bb79396634dc14b548e77489a1bc4d123b87aba"
+sha256 = "e6744ee5864925f44846d74fa0a92cb0347242cfbd8291c41ece984ec34ba1f7"
 source = "source/k3_mla_glue.cu"
 
 [kernels."k3_mla_absorb+QBF16=1"]
-sha256 = "2068f9365cfaa909e9fceed2b22efc2adfc7da57977d39813529f32683c5ba34"
+sha256 = "e255c187107128eefdba22cd7639ae5e0cb33bcb1be12ca3c4f1c9497f3570e9"
 source = "source/k3_mla_absorb.cu"
 defines = { QBF16 = 1 }
 

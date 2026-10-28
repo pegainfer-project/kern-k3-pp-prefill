@@ -116,6 +116,16 @@ comparison are at commit
   with per-sequence conv windows and states; the MLA layers run TRT-LLM
   gen's context FMHA batched over the sequences; the head reads each
   sequence's last row.
+- A long call's MLA layer attends its own rows through the causal FMHA and
+  its sequences' cached context in rounds of `--window` keys (65536) through
+  the dense sibling of the same kernel, each round gathered from the pages
+  and expanded to k | v while still in L2, every pass folded by its softmax
+  stats into an f32 accumulator the gate reads (`source/k3_fmha_plan.cuh`,
+  `source/k3_mla_glue.cu`). The expansion workspace is the window's, not the
+  context's: 4.3 GiB a stage at 64k against 60 GiB for a whole 1M context.
+  `harness/p_fmha_window.cu` checks the passes against the plain causal
+  call and an f32 reference and times them (8192 rows over 64k: +6%; over
+  256k in 64k rounds: +0.8%; an empty round 17 µs).
 - Every layer has its own KV or KDA state, so `kern cut` splits the
   whole-model manifest into stages that carry only their own layers'
   states. A stage hands the next one the hidden stream and the
