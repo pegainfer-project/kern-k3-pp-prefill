@@ -203,7 +203,7 @@ extern "C" __global__ void __launch_bounds__(NT) kern_k3g_mla_prep(
   for (int w = 0; w < NT / 32; ++w) total += wsum[w];
   unsigned nsm;
   asm("mov.u32 %0, %%nsmid;" : "=r"(nsm));
-  long long budget = nsm / 2 - B;
+  long long budget = (long long)(nsm / 2) - B;
   if (budget < 1) budget = 1;
   long long per = (total + budget - 1) / budget;
   if (per < 1) per = 1;

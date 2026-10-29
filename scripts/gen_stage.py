@@ -7,8 +7,8 @@ helpers, `once`, the kernel index, the FMHA and batched-GEMM ABI ports) are
 imported from the kern checkout KERN names:
 
     KERN=<kern checkout> KERN_INDEX_DIR=<kern master>/kernel_index \
-      python3 scripts/gen_stage.py --chunk 8192 --experts 896 --max-ctx 262144 > p.json
-    ... --tp 8 --experts 896 --max-ctx 327680 --moe-variants FC1,FC2 --peer-ar > d.json
+      python3 scripts/gen_stage.py --chunk 8192 --experts 896 > p.json
+    ... --tp 8 --experts 896 --moe-variants FC1,FC2 --peer-ar > d.json
 
 Both run layers [0, --layers) with the embedding and the head, and keep one
 state per layer (`kv.<i>`, `kda.<i>`), so `kern cut` can drop the layers a
@@ -20,7 +20,7 @@ and the head on each sequence's last row: `next_token` is one token a
 sequence. A KDA layer runs FlashKDA's kernel 1 and source/k3_kda_rec.cu from
 and to each sequence's line. An MLA layer expands the context's latent rows
 by kv_b and runs TensorRT-LLM's context FMHA (docs/k3-kernel-abi.md K13), or,
-for a call of at most --mla-short rows, attends in the latent space. The MoE
+over bf16 pages, for a call of at most --mla-short rows, attends in the latent space. The MoE
 runs TRT-LLM gen's batched GEMMs over every expert (k3_moe_bmm.py), routed in
 one call (source/k3_moe_route.cu) or, for the pruned checkpoint, by
 FlashInfer's routing kernels.
@@ -47,13 +47,9 @@ on one GPU holding every expert, with nothing to exchange or sum: the oracle
 the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 (one KDA layer, one MoE layer) has no MLA layer and no paged state.
 
-`--kv fp8` (D over a group): the MLA cache is SGLang's fp8 one, e4m3 at scale
-1. The append and the absorbed query land in e4m3 as SGLang casts them
-(k3_mla_prep's KV_FP8 build, k3_mla_absorb_mma's Q_FP8 build), the attention
-is FlashInfer's Cake kernel (source/flashinfer-cake-k3-mla), its splits
-planned by FlashInfer's planner at 148 SMs for a member's share of the
-capture context (scripts/cake_plan.py), and the exchange's CAKE build
-merges its splits with the members'.
+`--kv` picks the MLA cache: SGLang's fp8 (scripts/k3_kv_fp8.py, the default)
+or bf16 (scripts/k3_kv_bf16.py). A flavor owns its page bytes, D's absorb,
+attention and exchange, and P's absorbed short path (bf16's alone).
 
 The kernels are kern's own (docs/k3-kernel-abi.md, source/k3_*.cu): B is a
 runtime argument, every launch takes one row per block.x, and the landing /
@@ -65,14 +61,13 @@ import argparse
 import json
 import math
 import pathlib
-import struct
 import os
 import sys
+import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(1, str(pathlib.Path(os.environ["KERN"]) / "tools"))
 # This directory's forks first: kern's modules put kern's tools/ at the head of sys.path on import.
-import cake_plan
 import k3_moe_bmm
 from pinned import module
 import trtllm_fmha_abi
@@ -80,77 +75,15 @@ import varlen_abi
 import kern_manifest
 from once import Once, buf, seg
 import k3_once  # noqa: F401  K3's load-time ops, which kern's `once` no longer carries
+from k3_common import *  # noqa: F403
+import k3_kv_bf16
+import k3_kv_fp8
 
-H = 7168
-V = 163840
-HEADS, HEAD_DIM = 96, 128
-INNER = HEADS * HEAD_DIM           # 12288
-Q_LORA, KV_LORA, ROPE = 1536, 512, 64
-NOPE_DIM = 128  # per-head q/k dim before the rope part
-KV_A = KV_LORA + ROPE              # 576
-KV_EXP = HEADS * trtllm_fmha_abi.KV_ROW  # 30720, k 192 | v 128 per head
-Q_B = HEADS * 192                  # 18432
-WSM = 256                          # b_proj 96 | f_a 128 | pad
-TOPK, LATENT, INTER = 16, 3584, 3072
-# The checkpoint by its expert count: the pruned dev one, the full model.
-CHECKPOINTS = {224: "kimi-k3-pruned-75pct", 896: "kimi-k3"}
-SHARED = 2 * INTER                 # 6144
-DENSE_I = 33792
-ATTN_RES_BLOCK = 12
-NB_MAX = 8
-LAYERS = 93
-MLA_LAYERS = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87, 91, 92}
+KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 
-# KDA state line: the recurrent state [96,128,128] (bf16, or f32 with --kda-state f32) then the three
-# conv windows bf16 [3][12288] (q, k, v).
-# MLA latent cache: 64-token pages of [mla_layers][64][576] bf16.
-PAGE = 64
-LATENT_ROW = KV_A
-
-# MLA decode attention: FlashInfer's CuTe-DSL Blackwell kernel, prebuilt
-# (tools/kernels-bin/README.md), two entries in one module. It walks a row
-# in 128-token tiles; each row runs as `mla_bsk[b]` splits of a 2-CTA
-# cluster and a reduction merges them. The parameter ABI packed below is
-# the DSL's flattened struct layout (docs/k3-kernel-abi.md K5).
-MLA_MODULE = "mla_decode_h96_p64"
-MLA_MAIN = ("kernel_cutlass_split_kv_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp16"
-            "BlackwellMultiHeadLatentAttentionForwardFP16_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____0")
-MLA_REDUCE = ("kernel_cutlass_reduction_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp16"
-              "BlackwellMultiHeadLatentAttentionForwardFP16_object_at__tensorptrbf16gmemalign16odiv16i64div161i64div16_1")
-MLA_M_TILE = 128          # the MMA's row tile: 96 heads pad to one
-MLA_MAIN_SMEM = 232448
-# A short packed chunk's absorbed attention splits a row's KV at most this many ways.
-MLA_SHORT_SPLITS = 16
-# A long packed call's rows attend their own rows through the causal FMHA and their sequences' cached
-# context through its dense sibling in rounds of `window` keys (k3_fmha_plan.cuh), each pass's o and
-# softmax stats folded into an f32 accumulator (k3_mla_glue.cu). KV_PAD: the FMHA's KV tile, rows past
-# the last sequence's end a pass reads, kept zero.
-KV_PAD = 128
-FMHA_DENSE = "trtllm_fmha_dense_h192_v128"
-FMHA_DENSE_ENTRY = trtllm_fmha_abi.ENTRY.replace("Causal", "Dense")
-assert FMHA_DENSE_ENTRY != trtllm_fmha_abi.ENTRY
-MLA_REDUCE_SMEM = 1024    # 256-split reducer scratch
-ABSORB_SMEM = 1024 + 2 * 4 * 64 * 128 * 2 + 2 * 64 * 128 + 128  # k3_mla_absorb_tc.cu SMEM_BYTES
-
-# D's MLA decode attention over SGLang's fp8 cache (--kv fp8): FlashInfer's
-# Cake-generated Kimi-K3 kernel (source/flashinfer-cake-k3-mla), its wide
-# route, a two-CTA cluster per (row, split). SGLang captures a graph planned
-# for the longest context; Cake's planner (`plan_attention`, ported in
-# scripts/cake_plan.py) for a member's share of it then sends every batch
-# down this route with all rows as the same splits, (first batch, last
-# batch, splits). It plans at 148 SMs, B300's count; GB300 runs the same plan.
-CAKE_MAIN = "kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653"
-CAKE_SMEM = 232448
-CAKE_PLAN_SMS = 148
-
-T = "tokens"
-HF = "language_model."
-ROWS = "rows"
-CTX = "ctx"
 # k3_ar_fused.cu's KGRID, one block an SM: every block resident on 148 and 152 SMs, a multiple of the cluster of 8
 # and under the 256-row flag table
 TP_AR_GRID = 144
-TP_TIMEOUT_NS = 30_000_000_000  # a deadline that passes traps: long enough for any start skew
 DCP_GRID = 2 * 144  # k3_dcp.cu bounds the exchange to two blocks an SM: every block resident on 148 and 152 SMs
 KDA_SMEM_BLOCKS = 2 * 152  # ... and two of its blocks an SM: the batches of one wave of them
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
@@ -162,19 +95,6 @@ PF_MAX = 96 << 20  # of the GB300's 129 MB L2
 LAND_PF_MAX = 16 << 20  # the closing add's prefetch hints: their issue holds the grid the next GEMM waits on
 # ar_finalize_rms also loads the next o_proj's weight at evict_last; ar_attnres_rms after that o_proj demotes it
 PF_LAST = ".o_proj"
-
-# Launch geometry per entry, as the kernel headers document it
-# (docs/k3-kernel-abi.md §1). grid.x is always the batch.
-GEOM = {
-    "kern_k3_land_add_attnres_rms": ([T, 1, 1], [1024, 1, 1], 0),
-    "kern_k3_kda_core": ([T, HEADS, 1], [128, 1, 1], 0),
-    "kern_k3_mla_prep": ([T, 4, 1], [512, 1, 1], 0),  # 1 norm/append block + 3 gate segments
-    "kern_k3_mla_vup_gate": ([{"ceil_div": [T, 32]}, HEADS, 4], [256, 1, 1], 0),  # 32 rows x 32 dv per block
-    "kern_k3_router_topk": ([T, 1, 1], [256, 1, 1], 0),
-    "kern_k3_argmax_f32_partial": ([T, 64, 1], [1024, 1, 1], 0),
-    "kern_k3_argmax_f32_final": ([T, 1, 1], [64, 1, 1], 0),
-    "kern_k3_rms": ([T, 1, 1], [1024, 1, 1], 0),
-}
 
 
 # source/k3_gemm_f32.cu: D's K = 7168 f32 projections (qkvg 6400, front 6016) over 1-32 rows in cuBLAS's split-K
@@ -216,166 +136,6 @@ def is_mla(i):
     return i in MLA_LAYERS
 
 
-def launch(cubin, entry, grid=None, block=None, smem=None, var=T, defines=None, **extra):
-    """A launch of `entry`; `var` is the batch var its grid.x runs over,
-    `defines` selects a variant build of the source (handwritten.hw)."""
-    g, b, s = GEOM.get(entry, (None, None, 0))
-    g = [var if d == T else d for d in (grid or g)]
-    l = {**module(cubin, **(defines or {})), "entry": entry, "block": block or b, "grid": g, **extra}
-    s = s if smem is None else smem
-    if s:
-        l["shared_mem"] = s
-    return l
-
-
-def bf16(x):
-    """x rounded to bf16 (nearest even), as a float."""
-    bits = struct.unpack("<I", struct.pack("<f", x))[0]
-    return struct.unpack("<f", struct.pack("<I", ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) << 16))[0]
-
-
-def fast_divmod(d):
-    """The DSL's 32-bit FastDivmod divisor image: {divisor, multiplier, shift1, shift2},
-    q = ((x - mulhi(x, m)) >> s1 + mulhi(x, m)) >> s2."""
-    if d == 1:
-        return [{"at": 0, "i32": 1}, {"at": 4, "i32": 1}]
-    l = (d - 1).bit_length()
-    m = ((1 << (32 + l)) + d - 1) // d - (1 << 32)
-    return [{"at": 0, "i32": d}, {"at": 4, "i32": m - (1 << 32) if m >= 1 << 31 else m}, {"at": 8, "u8": 1},
-            {"at": 9, "u8": l - 1}]
-
-
-def pack(size, *fields):
-    return {"pack": {"size": size, "fields": list(fields)}}
-
-
-def dim(x):
-    """A batch dimension as a scalar arg: a var by name or an expression over one."""
-    return {"var": x} if isinstance(x, str) else {"expr": x}
-
-
-def mla_attn_op(batch_max, split_max, reduce=True, scale_log2=bf16((NOPE_DIM + ROPE) ** -0.5) * math.log2(math.e),
-                ours_from=None):
-    """The DSL attention as one op: split kernel + reduction, structs packed from the interface.
-    Interface: q_abs latent | q_abs rope (+1024 B) | kv latent | kv rope (+1024 B) | block_table |
-    seq_lens | mla_bsk | o_lat | lse | acc_o | acc_lse | B | max_pages, at most `batch_max` rows.
-    Without `reduce` the splits stay in acc_o / acc_lse for their merge (D's exchange, P's gate), and with
-    `ours_from` batches of that many rows take k3_mla_decode.cu instead (mla_decode_launch).
-    `scale_log2`: the softmax scale times log2(e)."""
-    batch = T
-    V = {"at": 0, **dim(batch)}
-    tmap = lambda param, d0, page, box1, stride1: pack(128, {"at": 0, "tensormap": {
-        "param": param, "dtype": "bf16", "dims": [d0, page, 0 if page == PAGE else batch_max],
-        "strides": [LATENT_ROW * 2, stride1], "box": [64, box1, 1], "swizzle": 128, "l2_promotion": 128}})
-    at = lambda off, f: {**f, "at": off}
-    q_stride, kv_stride = HEADS * LATENT_ROW * 2, PAGE * LATENT_ROW * 2
-    acc_o = pack(48, {"at": 0, "param": 9}, {"at": 8, "i32": MLA_M_TILE}, {"at": 12, "i32": split_max}, {"at": 16, "i32": KV_LORA},
-                 {"at": 20, "i32": 1}, at(24, V), {"at": 28, "i32": split_max * KV_LORA}, {"at": 32, "i32": KV_LORA},
-                 {"at": 36, "i32": split_max * MLA_M_TILE * KV_LORA}, {"at": 40, "i32": MLA_M_TILE * split_max * KV_LORA})
-    acc_lse = pack(40, {"at": 0, "param": 10}, {"at": 8, "i32": MLA_M_TILE}, {"at": 12, "i32": split_max}, {"at": 16, "i32": 1},
-                   at(20, V), {"at": 24, "i32": split_max}, {"at": 28, "i32": MLA_M_TILE * split_max},
-                   {"at": 32, "i32": MLA_M_TILE * split_max})
-    seqs = pack(16, {"at": 0, "param": 5}, {"at": 8, **dim(batch), "width": 8})
-    bsk = pack(16, {"at": 0, "param": 6}, {"at": 8, **dim(batch), "width": 8})
-    # the tiled-MMA descriptors and the TMA coordinate shapes are not read by this build; zero
-    main_params = ["bytes<64>", "bytes<64>", "bytes<128>", "bytes<8>", "bytes<128>", "bytes<8>", "bytes<128>", "bytes<12>",
-                   "bytes<128>", "bytes<12>", "bytes<128>", "bytes<12>", "bytes<24>", "bytes<48>", "bytes<24>", "bytes<48>",
-                   "bytes<40>", "i32", "bytes<16>", "bytes<16>", "f32", "f32", "i32", "i32", "i32", "bytes<12>", "bytes<12>",
-                   "bytes<12>"]
-    main_args = [
-        pack(64), pack(64),
-        tmap(0, KV_LORA, HEADS, 64, q_stride), pack(8, {"at": 0, "i32": KV_LORA}, at(4, V)),
-        tmap(1, ROPE, HEADS, 64, q_stride), pack(8, {"at": 0, "i32": ROPE}, at(4, V)),
-        tmap(2, KV_LORA, PAGE, 64, kv_stride), pack(12, {"at": 0, "i32": PAGE}, {"at": 4, "i32": KV_LORA}),
-        tmap(3, ROPE, PAGE, 64, kv_stride), pack(12, {"at": 0, "i32": PAGE}, {"at": 4, "i32": ROPE}),
-        tmap(2, KV_LORA, PAGE, 32, kv_stride), pack(12, {"at": 0, "i32": KV_LORA}, {"at": 4, "i32": PAGE}),
-        # page table [max_pages, B] strides (1, max_pages)
-        pack(24, {"at": 0, "param": 4}, {"at": 8, "param": 12}, at(12, V), {"at": 16, "param": 12, "width": 8}),
-        # o as (128, 512, tiles=1, B); lse as (128, 1, B): the split path never stores through these
-        pack(48, {"at": 0, "param": 7}, {"at": 8, "i32": KV_LORA}, {"at": 12, "i32": 1}, at(16, V), {"at": 24, "i64": KV_LORA},
-             {"at": 32, "i64": MLA_M_TILE * KV_LORA}, {"at": 40, "i64": HEADS * KV_LORA}),
-        pack(24, {"at": 0, "param": 8}, {"at": 8, "i32": 1}, at(12, V), {"at": 16, "i64": HEADS}),
-        acc_o, acc_lse,
-        {"i32": split_max}, seqs, bsk,
-        {"f32": scale_log2}, {"f32": 1.0},
-        {"param": 11}, {"i32": 1}, {"i32": split_max},
-        pack(12), pack(12, *fast_divmod(1)), pack(12, *fast_divmod(split_max)),
-    ]
-    reduce_params = ["bytes<48>", "bytes<40>", "bytes<48>", "bytes<40>", "i32", "bytes<16>", "bytes<16>"]
-    reduce_args = [
-        # o as (H, 512, S=1, B), lse as (H, 1, B)
-        pack(48, {"at": 0, "param": 7}, {"at": 8, "i32": HEADS}, {"at": 12, "i32": KV_LORA}, {"at": 16, "i32": 1}, at(20, V),
-             {"at": 24, "i64": KV_LORA}, {"at": 32, "i64": HEADS * KV_LORA}, {"at": 40, "i64": HEADS * KV_LORA}),
-        pack(40, {"at": 0, "param": 8}, {"at": 8, "i32": HEADS}, {"at": 12, "i32": 1}, at(16, V), {"at": 24, "i64": HEADS},
-             {"at": 32, "i64": HEADS}),
-        acc_o, acc_lse, {"i32": split_max}, seqs, bsk,
-    ]
-    mod = module(MLA_MODULE)
-    main = {**mod, "entry": MLA_MAIN, "params": main_params, "args": main_args, "block": [384, 1, 1],
-            "grid": [2, batch, split_max], "cluster": [2, 1, 1], "shared_mem": MLA_MAIN_SMEM}
-    ours = [] if reduce or ours_from is None else [
-        mla_decode_launch(batch_max, split_max, scale_log2, {"var": T, "min": ours_from})]
-    if ours:
-        main["when"] = {"var": T, "max": ours_from - 1}
-    return {
-        "params": ["in buffer<bf16>", "in buffer<bf16>", "in state", "in state", "in buffer<i32>", "in buffer<i32>",
-                   "in buffer<i32>", "out buffer<bf16>", "out buffer<f32>", "out buffer<f32>", "out buffer<f32>", "i32", "i32"],
-        "impl": {"launches": [main, *ours] + [
-            {**mod, "entry": MLA_REDUCE, "params": reduce_params, "args": reduce_args, "block": [128, 1, 1],
-             "grid": [HEADS, 1, batch], "shared_mem": MLA_REDUCE_SMEM},
-        ][:1 if reduce else 0]},
-    }
-
-
-# D's MLA decode over the DCP member's pages, its splits left for the exchange, from `--mla-ours-from` rows
-# (off by default): k3_mla_decode.cu, the DSL split kernel's grid and output (acc_o / acc_lse, `mla_bsk`
-# splits), a CTA pair a (row, split). It is the faster for a batch of one wave of items from 24 rows, the
-# slower below and over several waves (a skewed batch's): notes/r-attn.md.
-MLA_DECODE_SMEM = 232320  # k3_mla_decode.cu SMEM_BYTES
-
-
-def mla_decode_launch(batch_max, split_max, scale_log2, when):
-    """k3_mla_decode.cu over mla_attn_op's interface: q and the pages by 64 x 64 boxes of their 576-wide rows,
-    128 B swizzle."""
-    tmap = lambda param, d1, d2, stride: pack(128, {"at": 0, "tensormap": {
-        "param": param, "dtype": "bf16", "dims": [LATENT_ROW, d1, d2], "strides": [LATENT_ROW * 2, stride],
-        "box": [64, 64, 1], "swizzle": 128, "l2_promotion": 128}})
-    return {**module("k3_mla_decode"), "entry": "kern_k3_mla_decode",
-            "params": ["bytes<128>", "bytes<128>", "in buffer<i32>", "in buffer<i32>", "in buffer<i32>", "out buffer<f32>",
-                       "out buffer<f32>", "i32", "i32", "f32"],
-            "args": [tmap(0, HEADS, batch_max, HEADS * LATENT_ROW * 2), tmap(2, PAGE, 0, PAGE * LATENT_ROW * 2),
-                     {"param": 4}, {"param": 5}, {"param": 6}, {"param": 9}, {"param": 10}, {"i32": split_max},
-                     {"param": 12}, {"f32": scale_log2}],
-            "block": [224, 1, 1], "grid": [2, T, split_max], "cluster": [2, 1, 1], "shared_mem": MLA_DECODE_SMEM,
-            "when": when}
-
-
-def cake_attn_op(batch_max, splits):
-    """The Cake attention: per batch range of `splits`, one launch whose
-    every row runs as that range's splits, its partials left for the exchange.
-    Interface: q_abs (e4m3 [rows][576]) | kv | block_table | seq_lens |
-    cu_seqlens_q | part_o | part_max | part_sum | max_pages, at most `batch_max` rows."""
-    tmap = lambda param, rows, box0, swizzle: pack(128, {"at": 0, "tensormap": {
-        "param": param, "dtype": "u8", "dims": [KV_A, rows], "strides": [KV_A], "box": [box0, 64],
-        "swizzle": swizzle}})
-    q, kv = (lambda box0, sw: tmap(0, batch_max * HEADS, box0, sw)), (lambda box0, sw: tmap(1, 0, box0, sw))
-    params = ["bytes<128>"] * 5 + ["out buffer<bf16>", "out buffer<f32>", "out buffer<f32>", "out buffer<bf16>",
-                                   "in buffer<i32>", "in buffer<i32>", "in buffer<i32>", "f32", "f32", "i32", "i32",
-                                   "i32", "i32", "i32"]
-    args = lambda n: [q(128, 128), kv(128, 128), q(64, 64), kv(64, 64), kv(128, 128),
-                      {"param": 5}, {"param": 6}, {"param": 7}, {"param": 5}, {"param": 3}, {"param": 4}, {"param": 2},
-                      {"f32": (NOPE_DIM + ROPE) ** -0.5 * math.log2(math.e)}, {"f32": 1.0}, {"i32": HEADS},
-                      {"i32": n}, {"param": 8}, {"i32": 1}, {"i32": 0}]
-    return {
-        "params": ["in buffer<fp8e4m3>", "in state", "in buffer<i32>", "in buffer<i32>", "in buffer<i32>",
-                   "out buffer<bf16>", "out buffer<f32>", "out buffer<f32>", "i32"],
-        "impl": {"launches": [
-            {**module("cake_k3_mla_wide"), "entry": CAKE_MAIN, "params": params, "args": args(n), "block": [384, 1, 1],
-             "grid": [{"mul": [T, 2 * n]}, 1, 1], "cluster": [2, 1, 1], "shared_mem": CAKE_SMEM,
-             "when": {"var": T, "min": lo, "max": hi}}
-            for lo, hi, n in splits]},
-    }
-
 
 def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, experts=224, pack=16,
           peer_ar=False, mla_short=128, kv="fp8", mla_ours_from=None, window=65536, kda_state="bf16"):
@@ -395,19 +155,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # holding every expert, with nothing to exchange or sum.
     xchg = decode and tp > 1
     fused_ar = xchg and peer_ar
-    fp8 = kv == "fp8"
-    assert kv in ("bf16", "fp8") and kda_state in ("bf16", "f32")
-    assert not (fp8 and decode) or (xchg and seqs_max <= 64), "D's fp8 cache is under DCP, at most 64 rows"
-    # P's absorbed path (a short call over the latent pages) is the bf16 DSL kernel's: over fp8 pages every
-    # call expands its context
-    if chunk and fp8:
-        mla_short = 0
+    flavor = KV[kv]
+    assert kda_state in ("bf16", "f32")
+    flavor.check(decode, xchg, seqs_max)
+    if chunk:
+        mla_short = flavor.p_short(mla_short)
     state_bytes = 2 if kda_state == "bf16" else 4
     kda_state_defs = {"KDA_STATE_BF16": 1} if kda_state == "bf16" else {}
-    glue_defs_kv = {"KV_FP8": 1} if chunk and fp8 else None
-    # Cake's plan for a member's share of the capture context; the planner refuses fewer than 8192 positions.
-    cake_splits = cake_plan.cake_splits(-(-max_ctx // tp), CAKE_PLAN_SMS) if fp8 else ()
-    cake_rows = max((hi * n for _, hi, n in cake_splits), default=0)  # a batch's rows times its splits, at most
+    glue_defs_kv = flavor.P_GLUE
     # P routes its MoE in one call (k3_moe_route.cu), which takes the experts
     # by float4s: the pruned checkpoint's 224 route by FlashInfer's kernels,
     # the latent and the shared expert apart.
@@ -479,6 +234,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     def residual(entry):
         return launch("k3_prefill_glue", entry, grid=[T, 1, 1], block=[448, 1, 1], defines=glue_defs)
 
+    dcp_stage = tp * seqs_max * hl * (KV_LORA // 8 + 1) * 16
+    g = types.SimpleNamespace(seqs_max=seqs_max, tp=tp, max_ctx=max_ctx, mla_split_max=mla_split_max, xchg=xchg,
+                              mla_ours_from=mla_ours_from, max_pages=max_pages, dcp_stage=dcp_stage)
     ops = {
         "gemm_f32": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
@@ -554,8 +312,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                      {"pdl": True}),
                     ({"KDA_MINB": 4, "ROWS_PER_ITER": 2}, 0, {"min": kda_smem_rows + 1}, {}))]},
         },
-        "mla_attn": cake_attn_op(seqs_max, cake_splits) if fp8 else
-                    mla_attn_op(seqs_max, mla_split_max, reduce=not xchg, ours_from=mla_ours_from if xchg else None),
+        "mla_attn": flavor.d_attn_op(g),
         } if decode else {}),
         "gemm_bf16": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
@@ -641,24 +398,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "i64", "i64", "out buffer<bf16>", "out buffer<bf16>", "i32"],
             # k3_mla_prep.cu's fast path: the norm / append block and a gate block per 4096 columns
             "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 1 + -(-inner_l // 4096), 1],
-                                         defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l,
-                                                  **({"KV_FP8": 1} if fp8 else {})}) if tp > 1
+                                         defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l, **flavor.D_PREP})
+                                  if tp > 1
                                   else launch("k3_mla_prep", "kern_k3_mla_prep")]},
         },
-        # every member absorbs the whole batch's 96 heads, at most `seqs` rows: on tcgen05, a block a head, W_UK
-        # by a tensor map (64 columns x 128 rows a box, the 128 B swizzle its MMA reads); the fp8 query keeps
-        # mma.sync's kernel, whose e4m3 casts (software, no saturation) go two at a time
-        "mla_absorb": {
-            "params": ["in buffer<f32>", "in buffer<bf16>", f"out buffer<{'fp8e4m3' if fp8 else 'bf16'}>", "i32"],
-            "impl": {"launches": [launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[1, HEADS, 4],
-                                         block=[256, 1, 1], defines={"Q_FP8": 1}) if fp8 else launch(
-                "k3_mla_absorb_tc", "kern_k3_mla_absorb_tc", grid=[HEADS, 1, 1], block=[256, 1, 1], smem=ABSORB_SMEM,
-                params=["bytes<128>", "in buffer<f32>", "out buffer<bf16>", "i32"],
-                args=[{"pack": {"size": 128, "fields": [{"at": 0, "tensormap": {
-                    "param": 1, "dtype": "bf16", "dims": [KV_LORA, HEADS * 256], "strides": [KV_LORA * 2],
-                    "box": [64, NOPE_DIM], "swizzle": 128, "l2_promotion": 128}}]}},
-                      {"param": 0}, {"param": 2}, {"param": 3}])]},
-        },
+        # every member absorbs the whole batch's 96 heads, at most `seqs` rows
+        "mla_absorb": flavor.d_absorb_op(),
         "mla_vup_gate": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
             "impl": {"launches": [launch("k3_mla_vup_gate", "kern_k3_mla_vup_gate",
@@ -724,17 +469,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # the own pass's merge is the accumulator's first write
         ops["mla_merge_init"] = json.loads(json.dumps(ops["mla_merge"]).replace("inout buffer<f32>", "out buffer<f32>"))
         if mla_short:
-            ops["mla_absorb_short"] = {
-                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
-                "impl": {"launches": [launch("k3_mla_absorb", "kern_k3_mla_absorb", grid=[{"ceil_div": [T, 32]}, HEADS, 8],
-                                             block=[128, 1, 1], defines={"QBF16": 1}, **short)]},
-            }
-            # the FMHA's softmax scale (f32 192^-0.5), not the decode step's bf16-rounded one;
-            # the splits merged by the gate kernel, not the DSL's reduction launch
-            ops["mla_attn_short"] = mla_attn_op(mla_short, MLA_SHORT_SPLITS, reduce=False,
-                                                scale_log2=trtllm_fmha_abi.SCALE_LOG2)
-            for l in ops["mla_attn_short"]["impl"]["launches"]:
-                l.update(short)
+            ops.update(flavor.p_short_ops(mla_short))
         # the head on each sequence's last row
         ops["last_rows"] = {
             "params": ["out buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "i32", "i32"],
@@ -763,19 +498,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 "inout buffer<i32>", "out buffer<i32>", "i32", "i32", "i64", "i64"]
         xg = lambda **extra: launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1], block=[256, 1, 1],
                                     smem=HEAD_DIM // 2 * KV_LORA * 2, **extra)
-        # Cake's partials, every row as its batch's splits: a launch per range of the plan, the count a literal
-        ops["dcp_exchange"] = {
-            "params": ["in buffer<bf16>", "in buffer<f32>", "in buffer<f32>", "in buffer<i32>", *tail],
-            "impl": {"launches": [
-                xg(defines={"CAKE": 1}, params=["in buffer<bf16>", "in buffer<f32>", "in buffer<f32>", "in buffer<i32>",
-                                                "i32", *tail],
-                   args=[*({"param": i} for i in range(4)), {"i32": n}, *({"param": i} for i in range(4, 15))],
-                   when={"var": T, "min": lo, "max": hi})
-                for lo, hi, n in cake_splits]},
-        } if fp8 else {
-            "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "i32", *tail],
-            "impl": {"launches": [xg()]},
-        }
+        ops["dcp_exchange"] = flavor.d_exchange_op(g, xg, tail)
         ops["dcp_init"] = {
             "params": ["inout buffer<u8>", "i64"],
             "impl": {"launches": [launch("peer_allreduce_bf16", "kern_peer_lamport_init_bf16", defines={"NRANKS": tp},
@@ -892,7 +615,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # bytes: one Lamport stage, `tp` slots of D's widest bf16 sum: a MoE layer's, the routed latent's
     # `seqs_max` rows, then the shared expert's
     ar_stage = tp * seqs_max * (LATENT + H) * 2
-    dcp_stage = tp * seqs_max * hl * (KV_LORA // 8 + 1) * 16
     if fused_ar:
         buffers.update({
             # three stages, then the first call's handshake words (k3_ar_fused.cu), never poisoned
@@ -908,7 +630,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     kda_shard = ({"shard": {"group": "tp", "by": "heads",
                             "segments": [[1, HEADS * HEAD_DIM * HEAD_DIM * state_bytes], [9, INNER * 2]]}}
                  if xchg else {})
-    states = {**{f"kv.{i}": {"bytes_per_token": LATENT_ROW * (1 if fp8 else 2), **kv_shard} for i in mla_layers},
+    states = {**{f"kv.{i}": {"bytes_per_token": LATENT_ROW * flavor.BYTES, **kv_shard} for i in mla_layers},
               **{f"kda.{i}": {"bytes_per_seq": line_l, **kda_shard} for i in kda_layers}}
 
     def weight(name, shape, bind, dtype="bf16"):
@@ -921,8 +643,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     def shard(per):
         return {"group": "tp", "ranges": [[r * per, (r + 1) * per] for r in range(tp)]} if tp > 1 else None
 
-    i32 = lambda v: {"i32": v}
-    i64 = lambda v: {"i64": v}
     programs = {}
     once = Once({"buffers": buffers, "ops": ops, "programs": programs})
     derive = Once({"buffers": buffers, "ops": ops, "programs": programs})
@@ -959,8 +679,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     def gate_up(name, gate, up, per):
         """[gate; up], this member's rows of each."""
         weight(name, [2 * per, H], [seg(gate, rows=shard(per)), seg(up, rows=shard(per))])
-
-    b = lambda name, off=0: {"buf": name, "offset": off} if off else {"buf": name}
 
     def work(name, width, dtype="bf16", var=T):
         buffers[name] = {"dtype": dtype, "shape": [var, width], "kind": "workspace"}
@@ -1014,32 +732,15 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         work("q_norm", Q_LORA)
     if decode and mla:
         work("q_partial", Q_B, "f32")
-        work("q_abs", HEADS * LATENT_ROW, "fp8e4m3" if fp8 else "bf16")
-        work("o_lat", HEADS * KV_LORA)
-        work("mla_lse", HEADS, "f32")
-        work("mla_acc_o", mla_split_max * MLA_M_TILE * KV_LORA, "f32", var=seqs_max)
-        work("mla_acc_lse", mla_split_max * MLA_M_TILE, "f32", var=seqs_max)
+        work("q_abs", HEADS * LATENT_ROW, flavor.Q_ABS)
         buffers["mla_bsk"] = {"dtype": "i32", "shape": [T], "kind": "workspace"}
-    if fp8 and decode:
-        # Cake's partials: a batch's rows times its splits, each row's split-major
-        work("mla_part_o", HEADS * KV_LORA, var=cake_rows)
-        work("mla_part_max", HEADS, "f32", var=cake_rows)
-        work("mla_part_sum", HEADS, "f32", var=cake_rows)
-        buffers["cu_seqlens_q"] = {"dtype": "i32", "shape": [seqs_max + 1], "kind": "input", "fill": "cu_seqlens",
-                                   "domain": {"min": 0, "max": seqs_max, "monotone": True}}
+        flavor.d_buffers(work, buffers, g)
     if chunk:
         work("normed_last", H, var="seqs")
         # the absorbed attention of a short call (at most mla_short rows)
-        for name, width, dt in (("mla_row_table", max_pages, "i32"), ("mla_q_abs", HEADS * LATENT_ROW, "bf16"),
-                                ("mla_o_lat", HEADS * KV_LORA, "bf16"), ("mla_s_lse", HEADS, "f32"),
-                                ("mla_s_acc_o", MLA_SHORT_SPLITS * MLA_M_TILE * KV_LORA, "f32"),
-                                ("mla_s_acc_lse", MLA_SHORT_SPLITS * MLA_M_TILE, "f32")):
-            if mla_short:
-                work(name, width, dt, var=mla_short)
-        for name in ("mla_row_lens", "mla_row_bsk"):
-            if mla_short:
-                buffers[name] = {"dtype": "i32", "shape": [mla_short], "kind": "workspace"}
-        if not mla_short:
+        if mla_short:
+            flavor.p_short_buffers(work, buffers, mla_short, max_pages)
+        else:
             buffers["mla_stub"] = {"dtype": "i32", "shape": [8], "kind": "workspace"}
         work("q_bf16", Q_B)
         work("o_bf16", inner_l)
@@ -1105,7 +806,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
 
     # ---- program
     prog = []
-    B = {"var": T}
 
     def step(label, op, *args):
         prog.append({"label": label, "op": op, "args": list(args)})
@@ -1256,8 +956,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     # call's out through W_UV first)
                     # without the absorbed path (fp8 pages) its tables and partials are stand-ins nobody touches
                     s_table, s_lens, s_bsk, s_acc_o, s_acc_lse = (
-                        (b("mla_row_table"), b("mla_row_lens"), b("mla_row_bsk"), b("mla_s_acc_o"), b("mla_s_acc_lse"))
-                        if mla_short else (b("mla_stub"), b("mla_stub"), b("mla_stub"), b("mla_acc"), b("mla_acc_ms")))
+                        flavor.p_short_args() if mla_short else
+                        (b("mla_stub"), b("mla_stub"), b("mla_stub"), b("mla_acc"), b("mla_acc_ms")))
                     step(L + "prep", "mla_prep", b("mla_fused_partial"), w("gamma_q_a"), w("gamma_kv_a"),
                          b("slot_mapping"), {"state": kv, "offset": 0}, i64(page_stride), b("q_norm"),
                          b("block_table"), i32(max_pages), b("fmha_lens"), i32(NS), {"var": "seqs"},
@@ -1267,11 +967,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     step(L + "q_b", "gemm_bf16", b("q_norm"), w("w_q_b"), b("q_bf16"), B, i32(Q_B), i32(Q_LORA),
                          i32(Q_B))
                     if mla_short:
-                        step(L + "absorb", "mla_absorb_short", b("q_bf16"), w("w_kv_b"), b("mla_q_abs"), B)
-                        step(L + "attn_short", "mla_attn_short", b("mla_q_abs"), b("mla_q_abs", KV_LORA * 2),
-                             {"state": kv, "offset": 0}, {"state": kv, "offset": KV_LORA * 2},
-                             b("mla_row_table"), b("mla_row_lens"), b("mla_row_bsk"), b("mla_o_lat"), b("mla_s_lse"),
-                             b("mla_s_acc_o"), b("mla_s_acc_lse"), B, i32(max_pages))
+                        flavor.p_short_steps(step, w, L, kv, max_pages)
                     lens = lambda k, row: b("fmha_lens", (k * 4 + row) * NS * 4)
 
                     def fmha(label, op, kv_buf, k):
@@ -1297,25 +993,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B)
                     gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
-                    if fp8:
-                        step(L + "attn", "mla_attn", b("q_abs"), {"state": kv}, b("block_table"), b("seq_lens"),
-                             b("cu_seqlens_q"), b("mla_part_o"), b("mla_part_max"), b("mla_part_sum"), i32(max_pages))
-                        step(L + "dcp", "dcp_exchange", b("mla_part_o"), b("mla_part_max"), b("mla_part_sum"),
-                             b("seq_lens"), w("w_kv_b_l"), b("mla_gate"), b("gated"), b("dcp_lamport"),
-                             b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"), {"rank": "tp"}, B, i64(dcp_stage),
-                             i64(TP_TIMEOUT_NS))
-                    else:
-                        step(L + "attn", "mla_attn", b("q_abs"), b("q_abs", KV_LORA * 2), {"state": kv, "offset": 0},
-                             {"state": kv, "offset": KV_LORA * 2}, b("block_table"), b("seq_lens"), b("mla_bsk"),
-                             b("o_lat"), b("mla_lse"), b("mla_acc_o"), b("mla_acc_lse"), B, i32(max_pages))
-                        if xchg:
-                            # every head over this member's positions → this member's heads over all of them
-                            step(L + "dcp", "dcp_exchange", b("mla_acc_o"), b("mla_acc_lse"), b("seq_lens"),
-                                 b("mla_bsk"), i32(mla_split_max), w("w_kv_b_l"), b("mla_gate"), b("gated"),
-                                 b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"), {"rank": "tp"},
-                                 B, i64(dcp_stage), i64(TP_TIMEOUT_NS))
-                        else:
-                            step(L + "vup", "mla_vup_gate", b("o_lat"), w("w_kv_b"), b("mla_gate"), b("gated"), B)
+                    flavor.d_attn_steps(step, w, L, kv, g)
             else:
                 line = b("kda.line_index", kda_k * seqs_max * 4)
                 kda_k += 1
@@ -1627,10 +1305,10 @@ def main():
                     help="D: batches of at least ROWS rows take k3_mla_decode.cu for the MLA attention (default: the DSL)")
     ap.add_argument("--peer-ar", action="store_true",
                     help="D: the sums by the Lamport one-shot over the group's peers instead of NCCL")
-    ap.add_argument("--max-ctx", type=int, default=16384)
+    ap.add_argument("--max-ctx", type=int, default=1 << 20, help="the longest context a sequence reaches")
     ap.add_argument("--window", type=int, default=65536,
                     help="P: the cached keys an MLA layer expands and attends in one round")
-    ap.add_argument("--kv", choices=("fp8", "bf16"), default="fp8",
+    ap.add_argument("--kv", choices=tuple(KV), default="fp8",
                     help="the MLA cache: SGLang's fp8 (e4m3; D attends it with FlashInfer's Cake kernel, P lifts it to "
                          "bf16 for the expansion and has no absorbed short path) or bf16")
     ap.add_argument("--kda-state", choices=("bf16", "f32"), default="bf16", help="the KDA recurrent state's storage")

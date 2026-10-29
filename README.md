@@ -5,7 +5,7 @@ Full-size Kimi-K3 (896 experts, 93 layers) served disaggregated on the
 `kern-serve`:
 
 - **P**: the packed prefill (up to 16 sequences in a chunk of 8192 rows,
-  262144 context) as eight pipeline stages, one GPU each, cut every 12
+  1M context) as eight pipeline stages, one GPU each, cut every 12
   layers.
 - **D**: the decode step at TP8 / EP8 / DCP8, eight GPUs.
 
@@ -15,7 +15,7 @@ tools that check them.
 
 | Path | What it is |
 |---|---|
-| [`scripts/gen_stage.py`](scripts/gen_stage.py) | the generator of every K3 manifest here, on kern's `tools/` |
+| [`scripts/gen_stage.py`](scripts/gen_stage.py) | the generator of every K3 manifest here, on kern's `tools/`; its MLA cache by `--kv` from [`k3_kv_fp8.py`](scripts/k3_kv_fp8.py) (the default) or [`k3_kv_bf16.py`](scripts/k3_kv_bf16.py) |
 | [`scripts/deploy.sh`](scripts/deploy.sh) | the P stages and the D manifest of a deployment, verified |
 | [`scripts/k3_vllm.py`](scripts/k3_vllm.py) | a D manifest as vLLM's model forward, on [`k3_hosted.py`](scripts/k3_hosted.py)'s program boundary |
 | [`scripts/k3_sglang.py`](scripts/k3_sglang.py) | the same D as SGLang's model forward |

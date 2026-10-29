@@ -216,7 +216,7 @@ sha256 = "a8bf7838ec883196b7edfeffaa5f9323533452f7e00dc1502b24da39648b074d"
 source = "source/k3_moe_route.cu"
 
 [kernels."k3_mla_glue"]
-sha256 = "e6744ee5864925f44846d74fa0a92cb0347242cfbd8291c41ece984ec34ba1f7"
+sha256 = "ae5ff7f2ed88159f8214e07a2e4fa3bad3add4e471a65b4fdf8326fb7f6c376b"
 source = "source/k3_mla_glue.cu"
 
 [kernels."k3_mla_absorb+QBF16=1"]
@@ -289,7 +289,7 @@ source = "source/k3_gemm_f32.cu"
 defines = { BN = 32, CTA_KB = 100, SPLITS = 3 }
 
 [kernels."k3_mla_glue+KV_FP8=1"]
-sha256 = "29ad75dc790738ba72ce4a96c854d904f37789571259dcd187f5d835763c4a50"
+sha256 = "0ba911a2012c8d5809d52b57f1b0661524c8075c25810735f2685bab17dfdee7"
 source = "source/k3_mla_glue.cu"
 defines = { KV_FP8 = 1 }
 
