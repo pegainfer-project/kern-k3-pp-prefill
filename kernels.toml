@@ -238,6 +238,11 @@ sha256 = "8b4a88ab8182727ddf73aa330e3a979513fe36823a5c92a8d5ce16d847bc45a1"
 source = "source/k3_span_gather.cu"
 defines = { K9_LD = 49408, PARTIAL_BF16 = 1 }
 
+[kernels."k3_span_gather+K9_LD=49408+KDA_STATE_BF16=1+PARTIAL_BF16=1"]
+sha256 = "efd9f1d1091899947763d8de18e9c23d093533246a579cfe13adcd35c741270d"
+source = "source/k3_span_gather.cu"
+defines = { K9_LD = 49408, KDA_STATE_BF16 = 1, PARTIAL_BF16 = 1 }
+
 [kernels."k3_kda_rec+K12_LD=49408"]
 sha256 = "663253f41bd8eaaa4d586ddcedf826d7b3d06defc77f3b95c4cf235a830e81ad"
 source = "source/k3_kda_rec.cu"

@@ -359,7 +359,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 "impl": {"launches": [
                     launch("k3_span_gather", "kern_k3_span_gather_packed",
                            grid=[{"add": [{"mul": [{"ceil_div": [T, 48]}, 3 * (inner_l // 1024) + 1]}, 1]}, 1, 1],
-                           block=[128, 1, 1], defines={"PARTIAL_BF16": 1, "K9_LD": kfused})]},
+                           block=[128, 1, 1], defines={"PARTIAL_BF16": 1, "K9_LD": kfused, **kda_state_defs})]},
             },
             "flash_kda": varlen_abi.kda_op(hl, chunk_max, pack, module(varlen_abi.KDA_MODULE),
                                            module("k3_kda_rec", K12_LD=kfused, **kda_state_defs), T, "seqs"),
