@@ -6,9 +6,8 @@ License: Apache-2.0 (Copyright (c) 2022-2026, NVIDIA CORPORATION), `LICENSE` in
 this directory; every vendored file keeps its upstream header.
 
 These are TensorRT-LLM gen's MoE routing kernels as FlashInfer ships them. A
-stage holds all of its layers' experts (224 for the pruned checkpoint, 896 for
-the full model), more than kern's own routing glue (`k3_moe_prefill.cu`, 64
-local experts at most) handles. The kernels turn the router's precomputed
+D member holds 112 of the 896 experts (every 8th), more than kern's own
+routing glue (`k3_moe_prefill.cu`, 64 local experts at most) handles. The kernels turn the router's precomputed
 top-k ids into the tables the TRT-LLM gen batched GEMMs read. This is the same
 path SGLang takes for K3 (`trtllm_fp4_block_scale_routed_moe` with
 precomputed top-k).
@@ -59,8 +58,8 @@ This is exactly the set of FlashInfer headers the translation unit includes.
 
 - Rows within one expert are ordered by shared-memory atomics. The routing
   tables (`route_map`, `exp2perm`) therefore differ between runs. Every row's
-  GEMM result and the top-k combine do not: two runs of the four pruned PP4
-  stages wrote byte-identical outputs.
+  GEMM result and the top-k combine do not: two runs write byte-identical
+  outputs.
 - The padding rows of `route_map` are never written; the GEMMs stop at
   `cta_limit`.
 

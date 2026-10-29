@@ -7,8 +7,8 @@ helpers, `once`, the kernel index, the FMHA and batched-GEMM ABI ports) are
 imported from the kern checkout KERN names:
 
     KERN=<kern checkout> KERN_INDEX_DIR=<kern master>/kernel_index \
-      python3 scripts/gen_stage.py --chunk 8192 --experts 896 > p.json
-    ... --tp 8 --experts 896 --moe-variants FC1,FC2 --peer-ar > d.json
+      python3 scripts/gen_stage.py --chunk 8192 > p.json
+    ... --tp 8 --moe-variants FC1,FC2 --peer-ar > d.json
 
 Both run layers [0, --layers) with the embedding and the head, and keep one
 state per layer (`kv.<i>`, `kda.<i>`), so `kern cut` can drop the layers a
@@ -22,8 +22,7 @@ and to each sequence's line. An MLA layer expands the context's latent rows
 by kv_b and runs TensorRT-LLM's context FMHA (docs/k3-kernel-abi.md K13), or,
 over bf16 pages, for a call of at most --mla-short rows, attends in the latent space. The MoE
 runs TRT-LLM gen's batched GEMMs over every expert (k3_moe_bmm.py), routed in
-one call (source/k3_moe_route.cu) or, for the pruned checkpoint, by
-FlashInfer's routing kernels.
+one call (source/k3_moe_route.cu).
 
 D (`--tp R`): the decode step as SGLang's TP / EP / DCP decode runs it
 (decode/sglang-tp8-dcp8-ep8), one batch replicated on the group's R ranks.
@@ -137,10 +136,9 @@ def is_mla(i):
 
 
 
-def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, experts=224, pack=16,
+def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, pack=16,
           peer_ar=False, mla_short=128, kv="fp8", mla_ours_from=None, window=65536, kda_state="bf16"):
-    """P with `chunk_max`, else D over a `tp` group (see the module doc), of layers [0, `end`). `experts`: the
-    checkpoint's routed experts (CHECKPOINTS); `pack`: P's sequences a call; `window`: the cached keys a
+    """P with `chunk_max`, else D over a `tp` group (see the module doc), of layers [0, `end`). `pack`: P's sequences a call; `window`: the cached keys a
     P's MLA layer expands and attends at once; `peer_ar`: D's sums by the group's Lamport one-shot
     (source/peer_allreduce_bf16.cu) instead of NCCL; `kv`: the MLA cache, SGLang's fp8 (e4m3, scale 1; D
     attends it with the Cake kernel, P lifts it to bf16 for the expansion) or bf16; `kda_state`: the KDA
@@ -149,7 +147,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     decode = not chunk
     assert 0 < end <= LAYERS
     assert decode or (tp == 1 and pack > 1), "P is one GPU's packed prefill"
-    assert chunk or (HEADS % tp == 0 and experts % tp == 0), "D deals the heads and the experts over its group"
+    assert chunk or (HEADS % tp == 0 and EXPERTS % tp == 0), "D deals the heads and the experts over its group"
     layers = range(end)
     # A D group of one is the step's own oracle: the same ops on one GPU
     # holding every expert, with nothing to exchange or sum.
@@ -163,10 +161,16 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     state_bytes = 2 if kda_state == "bf16" else 4
     kda_state_defs = {"KDA_STATE_BF16": 1} if kda_state == "bf16" else {}
     glue_defs_kv = flavor.P_GLUE
-    # P routes its MoE in one call (k3_moe_route.cu), which takes the experts
-    # by float4s: the pruned checkpoint's 224 route by FlashInfer's kernels,
-    # the latent and the shared expert apart.
-    fused = chunk and experts % 128 == 0
+    # P's attention on e4m3 (q and the expanded k | v cast), the FMHA's fp8 builds
+    fp8_attn = chunk and flavor.P_FP8_ATTN
+    fmha_kernel = lambda name, entry: (module(name + "_e4m3" if fp8_attn else name),
+                                       entry.replace("QkvBfloat16", "QkvE4m3") if fp8_attn else entry)
+    attn_q, attn_sfx, attn_bytes = ("q_fp8", "_fp8", 1) if fp8_attn else ("q_bf16", "", 2)
+    # P's MXFP8 projections, vLLM's online mxfp8 of in_proj_qkvgfab, fused_qkv_a_g_proj and the routed expert's
+    # down / up: the weight quantized as it loads, the activation per call (k3_mxfp8.cu), cuBLASLt's GEMM over
+    # both scales; a [rows, k] operand's scales in cuBLAS's 128x4 tiles
+    mx = chunk and flavor.P_MXFP8
+    sf_len = lambda rows, k: -(-rows // 128) * 128 * -(-k // 128) * 4
     if chunk:
         seqs_max = pack
     # A packed call's sequences' cached keys back to back (`ctx` is the sum of
@@ -194,10 +198,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # scales and the routing) over every expert in P; over a D member's every
     # tp-th one for every row, its combine over every row the flat MoE
     # all-reduce sums (`seqs_max`), writing zeros past `tokens`.
-    epr = experts // tp
-    bp = (k3_moe_bmm.pieces(epr, experts, T, seqs_max, seqs_max, prefix="moe.", names=moe_variants, stride=tp,
+    epr = EXPERTS // tp
+    bp = (k3_moe_bmm.pieces(epr, T, seqs_max, seqs_max, prefix="moe.", names=moe_variants, stride=tp,
                             pdl=True) if decode else
-          k3_moe_bmm.pieces(epr, experts, T, chunk_max, {"mul": [T, 1]}, prefix="moe.", names=moe_variants))
+          k3_moe_bmm.pieces(epr, T, chunk_max, {"mul": [T, 1]}, prefix="moe.", names=moe_variants))
     # This rank's KDA and MLA heads: whole, or a D member's shard (heads, the
     # per-head weights and the KDA state line all HEADS / tp wide; the kernels
     # are built for that width, the binds cut the checkpoint's tensors).
@@ -218,8 +222,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # rank's shared gate | up rows (one read of 86 MB at 6016 columns instead of
     # three launches with their split-K reduces); each reader takes its
     # columns of the f32 row.
-    front = experts + LATENT + 2 * sh_l if xchg else 0
-    glue_defs = {"EXPERTS": experts} if experts != 224 else None
+    front = EXPERTS + LATENT + 2 * sh_l if xchg else 0
     # P's projections land in their GEMM's epilogue (cuBLASLt, bf16 D); D's
     # KDA kernels read f32 projections.
     kpart = "bf16" if chunk else "f32"
@@ -232,7 +235,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # batch's the decode form, a row per 1024 threads: at 64 rows the glue's
     # 7-warp row leaves most SMs idle.
     def residual(entry):
-        return launch("k3_prefill_glue", entry, grid=[T, 1, 1], block=[448, 1, 1], defines=glue_defs)
+        return launch("k3_prefill_glue", entry, grid=[T, 1, 1], block=[448, 1, 1])
 
     dcp_stage = tp * seqs_max * hl * (KV_LORA // 8 + 1) * 16
     g = types.SimpleNamespace(seqs_max=seqs_max, tp=tp, max_ctx=max_ctx, mla_split_max=mla_split_max, xchg=xchg,
@@ -244,18 +247,13 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         },
         **({f"gemm_t{n}": gemm_t_op(n, H) for n in (front, kfused)} if xchg else {}),
         # K1 residual stream
-        **({"attnres_rms": {
-            "params": ["in buffer<bf16>", "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>",
-                       "i32", "i32", "i32"],
-            "impl": {"launches": [residual("kern_k3g_attnres_rms")]},
-        }} if chunk and not fused else {}),
         # The embedding gather and the first layer's norm (nb == 0: the mix is the row) in one launch.
         **({"embed_rms": {
             "params": ["in buffer<i64>", "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "in buffer<bf16>",
                        "out buffer<bf16>", "i32"],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_embed_rms", grid=[T, 1, 1], block=[1024, 1, 1])]},
-        }} if not fused else {}),
-        # A fused P's: also its stage's setup, the MoE routing state zeroed and the FMHA's tables.
+        }} if decode else {}),
+        # P's: also its stage's setup, the MoE routing state zeroed and the FMHA's tables.
         **({"embed_rms_setup": {
             "params": ["in buffer<i64>", "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "in buffer<bf16>",
                        "out buffer<bf16>", "in buffer<i32>", "in buffer<i64>", "out buffer<i32>", "i32", "i32", "i32",
@@ -265,7 +263,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<bf16>", "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>",
                        "i32", "i32", "out buffer<u32>", "i32", "i32"],
             "impl": {"launches": [residual("kern_k3g_attnres_rms_setup")]},
-        }} if fused else {}),
+        }} if chunk else {}),
         # ... and D's MLA split plan (k3_mla_split_plan) in the same launch, a row's per block
         **({"embed_rms_plan": {
             "params": ["in buffer<i64>", "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "in buffer<bf16>",
@@ -289,8 +287,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # P's closing add on its own, before a snapshot layer.
         **({"land_add2": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
-            "impl": {"launches": [launch("k3_prefill_glue", "kern_k3g_land_add2", grid=[T, 4, 1], block=[224, 1, 1],
-                                         defines=glue_defs)]},
+            "impl": {"launches": [launch("k3_prefill_glue", "kern_k3g_land_add2", grid=[T, 4, 1], block=[224, 1, 1])]},
         }} if chunk else {}),
         **({
         # K2 + K3 KDA: the short conv in the delta rule's prologue
@@ -359,20 +356,17 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 "impl": {"launches": [
                     launch("k3_span_gather", "kern_k3_span_gather_packed",
                            grid=[{"add": [{"mul": [{"ceil_div": [T, 48]}, 3 * (inner_l // 1024) + 1]}, 1]}, 1, 1],
-                           block=[128, 1, 1], defines={"PARTIAL_BF16": 1, "K9_LD": kfused})]},
+                           block=[128, 1, 1], defines={"PARTIAL_BF16": 1, "K9_LD": kfused, **kda_state_defs})]},
             },
             "flash_kda": varlen_abi.kda_op(hl, chunk_max, pack, module(varlen_abi.KDA_MODULE),
                                            module("k3_kda_rec", K12_LD=kfused, **kda_state_defs), T, "seqs"),
-            "fmha_lens": {
-                "params": ["in buffer<i32>", "in buffer<i64>", "out buffer<i32>", "i32", "i32", "i32", "i32", "i32"],
-                "impl": {"launches": [launch("k3_prefill", "kern_k3_fmha_lens_varlen", grid=[1, 1, 1],
-                                             block=[32, 1, 1])]},
-            },
             # the own rows' causal pass and a round's dense pass, each writing its softmax stats
-            "mla_fmha_own": varlen_abi.fmha_op(HEADS, chunk_max, chunk_max + KV_PAD, module(trtllm_fmha_abi.MODULE),
-                                               T, "seqs"),
-            "mla_fmha_round": varlen_abi.fmha_op(HEADS, chunk_max, window + KV_PAD, module(FMHA_DENSE), T, "seqs",
-                                                 entry=FMHA_DENSE_ENTRY),
+            "mla_fmha_own": (lambda mod, entry: varlen_abi.fmha_op(
+                HEADS, chunk_max, chunk_max + KV_PAD, mod, T, "seqs", entry=entry, fp8=fp8_attn))(
+                *fmha_kernel(trtllm_fmha_abi.MODULE, trtllm_fmha_abi.ENTRY)),
+            "mla_fmha_round": (lambda mod, entry: varlen_abi.fmha_op(
+                HEADS, chunk_max, window + KV_PAD, mod, T, "seqs", entry=entry, fp8=fp8_attn))(
+                *fmha_kernel(FMHA_DENSE, FMHA_DENSE_ENTRY)),
             # k3_mla_glue.cu: a pass folded into the accumulator, the gate over it
             "mla_merge": {
                 "params": ["in buffer<bf16>", "in buffer<f32>", "in buffer<i32>", "i32", "i32", "inout buffer<f32>",
@@ -415,10 +409,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         "router_topk": {
             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "out buffer<i32>", "out buffer<f32>", "i32"],
             "impl": {"launches": [launch("k3_prefill_glue", "kern_k3g_router_topk", grid=[{"ceil_div": [T, 4]}, 1, 1],
-                                         block=[128, 1, 1], defines=glue_defs) if chunk else
+                                         block=[128, 1, 1]) if chunk else
                                   launch("k3_router_argmax", "kern_k3_router_topk",
-                                         block=[-(-experts // 256) * 256, 1, 1],
-                                         defines={"EXPERTS": experts} if experts != 224 else None)]},
+                                         block=[-(-EXPERTS // 256) * 256, 1, 1])]},
         },
         **({"moe_front": {
             # router top-k + latent land / mxfp8 + shared situ, then the last row's block builds the routing tables;
@@ -430,7 +423,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "i32", "i32"],
             "impl": {"launches": [{**launch("k3_moe_front", "kern_k3_moe_front", grid=[{"add": [T, H // 64]}, 1, 1],
                                             block=[1024, 1, 1], smem=1024 + 2 * sh_l * 128 + 64 * 64 * 2,
-                                            defines={"EXPERTS": experts, "LDS": front, "SH": sh_l, "STRIDE": tp}),
+                                            defines={"EXPERTS": EXPERTS, "LDS": front, "SH": sh_l, "STRIDE": tp}),
                                    "pdl": True}]},
         }} if front else {}),
         **({"rms": {
@@ -464,6 +457,28 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
             "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn", **long_}]},
         }
+        if mx:
+            ops["mxfp8_quant"] = {
+                "params": ["in buffer<bf16>", "i32", "out buffer<fp8e4m3>", "out buffer<u8>", "i32", "i32"],
+                "impl": {"launches": [launch("k3_mxfp8", "kern_k3_mxfp8_quant", grid=[8 * 152, 1, 1],
+                                             block=[256, 1, 1])]},
+            }
+            ops["gemm_mxfp8"] = {
+                "params": ["in buffer<fp8e4m3>", "in buffer<fp8e4m3>", "out buffer<bf16>", "in buffer<u8>",
+                           "in buffer<u8>", "i32", "i32", "i32", "i32"],
+                "impl": {"launches": [{"entry": "extern:cublaslt_mxfp8_tn"}]},
+            }
+            ops["gemm_bf16_acc"] = {
+                "params": ["in buffer<bf16>", "in buffer<bf16>", "inout buffer<bf16>", "i32", "i32", "i32", "i32",
+                           "i32"],
+                "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn_acc"}]},
+            }
+        if fp8_attn:
+            ops["mla_e4m3"] = {
+                "params": ["in buffer<bf16>", "out buffer<fp8e4m3>", "i32", "i32"],
+                "impl": {"launches": [launch("k3_mla_glue", "kern_k3g_e4m3", grid=[8 * 152, 1, 1], block=[256, 1, 1],
+                                             defines=glue_defs_kv, **long_)]},
+            }
         for name in ("mla_fmha_own", "mla_fmha_round", "mla_merge"):
             ops[name]["impl"]["launches"][0].update(long_)
         # the own pass's merge is the accumulator's first write
@@ -579,12 +594,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             ops[name] = {
                 "params": ["in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
                 "impl": {"launches": [launch("k3_prefill_glue", "kern_k3g_situ", grid=[T, -(-n // 2048), 1],
-                                             block=[256, 1, 1], defines=glue_defs)]},
+                                             block=[256, 1, 1])]},
             }
         return name
 
     ops.update(bp["ops"])
-    if fused:
+    if chunk and not mx:
         ops["k3_concat_cols"] = {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
             "impl": {"launches": [launch("k3_moe_route", "kern_k3_concat_cols",
@@ -638,6 +653,15 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
 
     def carry(name, shape, dtype="bf16"):
         buffers[name] = {"dtype": dtype, "shape": list(shape), "kind": "carry"}
+
+    def mxfp8(name):
+        """A bf16 weight's MXFP8 copy, `name`.q and its scales `name`.sf, quantized while the weights load."""
+        rows, k = buffers[name]["shape"]
+        buffers[name]["kind"] = "source"
+        carry(name + ".q", [rows, k], "fp8e4m3")
+        carry(name + ".sf", [sf_len(rows, k)], "u8")
+        derive.calls.append({"label": f"load.mxfp8.{name}", "op": "mxfp8_quant",
+                             "args": [buf(name), i32(k), buf(name + ".q"), buf(name + ".sf"), i32(rows), i32(k)]})
 
     # This member's `per`-wide slice of a tp-split axis, or all of it.
     def shard(per):
@@ -727,6 +751,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         work("span_flow", HEAD_DIM, var=chunk_max)
         work("span_g", inner_l, var=chunk_max)
         buffers.update(varlen_abi.kda_workspace(hl, chunk_max, pack))
+    if mx:
+        for q, k in (("normed", H), ("lat", LATENT)):
+            work(q + "_q", k, "fp8e4m3", var=RW)
+            buffers[q + "_sf"] = {"dtype": "u8", "shape": [sf_len(RW, k)], "kind": "workspace"}
     if mla:
         work("mla_fused_partial", mla_fused_l, kpart)
         work("q_norm", Q_LORA)
@@ -749,6 +777,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         work("kv_own", KV_EXP, var=chunk_max + KV_PAD)
         work("latent_g", KV_A, var=window + KV_PAD)
         work("kv_exp", KV_EXP, var=window + KV_PAD)
+        if fp8_attn:
+            work("q_fp8", Q_B, "fp8e4m3")
+            work("kv_own_fp8", KV_EXP, "fp8e4m3", var=chunk_max + KV_PAD)
+            work("kv_exp_fp8", KV_EXP, "fp8e4m3", var=window + KV_PAD)
         # the own pass's set and a set a round: seq_lens_kv | cum_q | cum_kv | aux, NS words each
         buffers["fmha_lens"] = {"dtype": "i32", "shape": [(1 + rounds) * 4 * NS], "kind": "workspace"}
         work("fmha_stats", 2 * HEADS, "f32")
@@ -762,29 +794,27 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         buffers["sh_ready"] = {"dtype": "i32", "shape": [H // 64, 64], "kind": "carry"}  # moe_front's shared-expert flags
         buffers["sh_ids"] = {"dtype": "i32", "shape": [H // 64, 64], "kind": "carry"}  # and its rows' ids, to them
     else:
-        work("router_partial", experts, "f32", var=RW)
+        work("router_partial", EXPERTS, "f32", var=RW)
     work("topk_idx", TOPK, "i32", var=RW)
     work("topk_weight", TOPK, "f32", var=RW)
     if decode and not front:
         work("latent_partial", LATENT, "f32", var=RW)
-    if fused:
+    if chunk:
         # lat_down | the shared expert's gate | up, one GEMM's rows
         work("moe_front", LATENT + 2 * sh_l, var=RW)
     else:
         work("latent", LATENT, var=RW)
     work("latent_q", LATENT, "u8", var=RW)
     work("latent_sf", LATENT // 32, "u8", var=RW)
-    if fused:
+    if chunk:
         # the routed latent normed | the shared expert's activation, one GEMM's rows
         work("moe_back", LATENT + sh_l, var=RW)
     else:
         work("routed_latent_norm", LATENT, var=RW)
         work("shared_act", sh_l, var=RW)
     work("routed_partial", H, var=RW)
-    if not front and not fused:
+    if decode and not front:
         work("shared_partial", 2 * sh_l, var=RW)
-    if chunk and not fused:
-        work("shared_partial2", H, var=RW)
     work("dense_partial", 2 * dn_l, var=RW)
     work("dense_act", dn_l, var=RW)
     if xchg:
@@ -830,6 +860,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             m = rows8
         step(label, "gemm_bf16" if dt == "bf16" else f32_op(n, k), a, w, c, m, i32(n), i32(k), i32(n))
 
+    def mx_gemm(label, q, a, ld, w, name, c, n, k, ldc):
+        """`a` (rows `ld` apart) to MXFP8 in `q`_q / `q`_sf, then C[:, :n] (rows `ldc` apart) = a · `name`ᵀ."""
+        step(label + "_mx", "mxfp8_quant", a, i32(ld), b(q + "_q"), b(q + "_sf"), B, i32(k))
+        step(label, "gemm_mxfp8", b(q + "_q"), w(name + ".q"), c, b(q + "_sf"), w(name + ".sf"), B, i32(n), i32(k),
+             i32(ldc))
+
     def land(label, p, o, n, off, ldc):
         step(label, land_op(n), p, o, i32(n), i32(off), i32(ldc), B)
 
@@ -870,9 +906,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
              w("gamma_o"), b("gated"), b("span_at"), b("span_progress"))
 
     def emit():
-        if chunk and not fused:
-            step("fmha_lens", "fmha_lens", b("seq_lens"), b("cu_seqlens"), b("fmha_lens"), {"var": "seqs"},
-                 i32(NS), i32(mla_short), i32(window), i32(rounds))
         blocks, kda_k = 0, 0
         # A layer's closing landing add (label, p1, p2, two), for the next
         # layer's mix to fuse; P's snapshot layer, where a stage cut falls,
@@ -923,7 +956,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             nb_mlp = blocks
 
             # residual mix in + snapshot + norm → normed
-            if i == 0 and fused:
+            if i == 0 and chunk:
                 step(L + "res_in", "embed_rms_setup", b("token_ids"), b("embed"), b("hidden"), b("blocks"),
                      w("gamma_in"), b("normed"), b("seq_lens"), b("cu_seqlens"), b("fmha_lens"), {"var": "seqs"},
                      i32(NS), i32(mla_short), i32(window), i32(rounds), b("moe.route_sync"),
@@ -934,19 +967,19 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             elif i == 0:
                 step(L + "res_in", "embed_rms", b("token_ids"), b("embed"), b("hidden"), b("blocks"), w("gamma_in"),
                      b("normed"), B)
-            elif chunk and snapshot and fused:
+            elif chunk and snapshot:
                 close()
                 step(L + "res_in", "attnres_rms_setup", b("hidden"), b("blocks"), w("sw_attn"), w("gamma_in"),
                      b("normed"), i32(nb_in), i32(1), b("moe.route_sync"), i32(bp["route_sync_words"]), B)
-            elif chunk and snapshot:
-                close()
-                step(L + "res_in", "attnres_rms", b("hidden"), b("blocks"), w("sw_attn"), w("gamma_in"), b("normed"),
-                     i32(nb_in), i32(1), B)
             else:
                 mix_in(L + "res_in", w("sw_attn"), w("gamma_in"), nb_in, int(snapshot))
             if is_mla(i):
                 kv = f"kv.{i}"
-                proj(L + "wfu", b("normed"), w("wfu"), b("mla_fused_partial"), mla_fused_l, H, dt=kpart)
+                if mx:
+                    mx_gemm(L + "wfu", "normed", b("normed"), H, w, "wfu", b("mla_fused_partial"), mla_fused_l, H,
+                            mla_fused_l)
+                else:
+                    proj(L + "wfu", b("normed"), w("wfu"), b("mla_fused_partial"), mla_fused_l, H, dt=kpart)
                 if chunk:
                     # q_norm and the latent row appended, the chunk's own latent rows expanded to k | v;
                     # a short call's q folded into the latent space, the attention over the latent pages
@@ -966,12 +999,18 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          dim({"add": [T, KV_PAD]}), i32(KV_EXP), i32(KV_A), i32(KV_EXP))
                     step(L + "q_b", "gemm_bf16", b("q_norm"), w("w_q_b"), b("q_bf16"), B, i32(Q_B), i32(Q_LORA),
                          i32(Q_B))
+                    if fp8_attn:
+                        step(L + "own_cast", "mla_e4m3", b("kv_own"), b("kv_own_fp8"), dim({"add": [T, KV_PAD]}),
+                             i32(KV_EXP))
+                        step(L + "q_cast", "mla_e4m3", b("q_bf16"), b("q_fp8"), B, i32(Q_B))
                     if mla_short:
                         flavor.p_short_steps(step, w, L, kv, max_pages)
                     lens = lambda k, row: b("fmha_lens", (k * 4 + row) * NS * 4)
 
                     def fmha(label, op, kv_buf, k):
-                        step(label, op, b("q_bf16"), b(kv_buf), b(kv_buf, trtllm_fmha_abi.HQK * 2), b("o_bf16"),
+                        kv_buf += attn_sfx
+                        step(label, op, b(attn_q), b(kv_buf), b(kv_buf, trtllm_fmha_abi.HQK * attn_bytes),
+                             b("o_bf16"),
                              lens(k, 0), lens(k, 1), lens(k, 2), b("fmha_scratch"),
                              b("fmha_scratch", trtllm_fmha_abi.PARTIAL_O_OFFSET), b("fmha_stats"))
                         step(label + "_merge", "mla_merge_init" if k == 0 else "mla_merge", b("o_bf16"), b("fmha_stats"),
@@ -984,6 +1023,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                              i32(r), i32(window), dim(round_rows(r)))
                         step(L + f"expand{r}", "gemm_bf16_long", b("latent_g"), w("w_aug"), b("kv_exp"),
                              dim(round_rows(r)), i32(KV_EXP), i32(KV_A), i32(KV_EXP))
+                        if fp8_attn:
+                            step(L + f"cast{r}", "mla_e4m3", b("kv_exp"), b("kv_exp_fp8"), dim(round_rows(r)),
+                                 i32(KV_EXP))
                         fmha(L + f"attn{r}", "mla_fmha_round", "kv_exp", 1 + r)
                     step(L + "gate", "mla_gate", b("gated"), b("mla_acc"), b("mla_fused_partial"), s_acc_o, s_acc_lse,
                          s_lens, s_bsk, i32(MLA_SHORT_SPLITS), w("w_kv_b"), b("mla_acc_ms"), i32(inner_l),
@@ -997,7 +1039,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             else:
                 line = b("kda.line_index", kda_k * seqs_max * 4)
                 kda_k += 1
-                if kfused:
+                if mx:
+                    mx_gemm(L + "qkvg", "normed", b("normed"), H, w, "wkda", b("kda_partial"), kfused, H, kfused)
+                elif kfused:
                     proj(L + "qkvg", b("normed"), w("wkda"), b("kda_partial"), kfused, H, dt=kpart)
                 else:
                     proj(L + "qkvg", b("normed"), w("wbig"), b("kda_partial"), fused_l, H, dt=kpart)
@@ -1042,7 +1086,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          w("sh_down"), b("moe_flat", seqs_max * LATENT * 2), w("moe.w13s"), w("moe.w13_sfs"),
                          {"rank": "tp"}, B)
                 else:
-                    gemm(L + "router", b("normed"), w("w_router"), b("router_partial"), experts, H)
+                    gemm(L + "router", b("normed"), w("w_router"), b("router_partial"), EXPERTS, H)
                     step(L + "topk", "router_topk", b("router_partial"), w("bias"), w("rs"), b("topk_idx"),
                          b("topk_weight"), B)
                     gemm(L + "lat_down", b("normed"), w("w_lat_down"), b("latent_partial"), LATENT, H)
@@ -1078,14 +1122,20 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     step(L + "lat_norm", "rms", b(moe), w("gamma_lat"), b("routed_latent_norm"), i32(LATENT), B)
                 proj(L + "lat_up", b("routed_latent_norm"), w("w_lat_up"), b("routed_partial"), H, LATENT)
                 closing = (L + "hidden", b("routed_partial"), b(moe, shared_at), 1)
-            elif fused:
+            else:
                 # lat_down and the shared expert's gate | up one GEMM; the top-k, the latent's mxfp8, the
                 # routing tables and the shared activation one call; the combine lands its row and norms
                 # it (lat_norm) in one pass, next to the shared activation; lat_up and the shared down
                 # projection one GEMM over both (K = 3584 + 6144), one partial
-                gemm(L + "router", b("normed"), w("w_router"), b("router_partial"), experts, H)
-                proj(L + "front", b("normed"), w("w_moe_front"), b("moe_front"), LATENT + 2 * sh_l, H)
+                gemm(L + "router", b("normed"), w("w_router"), b("router_partial"), EXPERTS, H)
                 back = LATENT + sh_l
+                if mx:
+                    mx_gemm(L + "lat_down", "normed", b("normed"), H, w, "w_lat_down", b("moe_front"), LATENT, H,
+                            LATENT + 2 * sh_l)
+                    step(L + "sh_gu", "gemm_bf16", b("normed"), w("w_sh_gu"), b("moe_front", LATENT * 2), B,
+                         i32(2 * sh_l), i32(H), i32(LATENT + 2 * sh_l))
+                else:
+                    proj(L + "front", b("normed"), w("w_moe_front"), b("moe_front"), LATENT + 2 * sh_l, H)
                 prog.append(bp["route_step"](b("router_partial"), w("bias"), w("rs"), b("moe_front"),
                                              LATENT + 2 * sh_l, b("moe_front", LATENT * 2), LATENT + 2 * sh_l,
                                              b("latent_q"), b("latent_sf"), b("topk_idx"), b("topk_weight"),
@@ -1094,24 +1144,13 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                         w("moe.w13s"), w("moe.w13_sfs"), w("moe.w2s"), w("moe.w2_sfs"),
                                         w("moe.alpha"), w("moe.beta"), b("moe_back"),
                                         gamma=w("gamma_lat"), label=L, routed=True, ldo=back))
-                proj(L + "back", b("moe_back"), w("w_moe_back"), b("routed_partial"), H, back)
+                if mx:
+                    mx_gemm(L + "lat_up", "lat", b("moe_back"), back, w, "w_lat_up", b("routed_partial"), H, LATENT, H)
+                    step(L + "sh_down", "gemm_bf16_acc", b("moe_back", LATENT * 2), w("sh_down"), b("routed_partial"),
+                         B, i32(H), i32(sh_l), i32(H), i32(back))
+                else:
+                    proj(L + "back", b("moe_back"), w("w_moe_back"), b("routed_partial"), H, back)
                 closing = (L + "hidden", b("routed_partial"), b("routed_partial"), 0)
-            else:
-                gemm(L + "router", b("normed"), w("w_router"), b("router_partial"), experts, H)
-                step(L + "topk", "router_topk", b("router_partial"), w("bias"), w("rs"), b("topk_idx"),
-                     b("topk_weight"), B)
-                proj(L + "lat_down", b("normed"), w("w_lat_down"), b("latent"), LATENT, H)
-                step(L + "moe_quant", "moe_quant", b("latent"), b("latent_q"), b("latent_sf"), B, i32(LATENT))
-                prog.extend(bp["steps"](b("latent_q"), b("latent_sf"), b("topk_idx"), b("topk_weight"),
-                                        w("moe.w13s"), w("moe.w13_sfs"), w("moe.w2s"), w("moe.w2_sfs"),
-                                        w("moe.alpha"), w("moe.beta"), b("routed_latent_norm"),
-                                        gamma=w("gamma_lat"), label=L))
-                proj(L + "lat_up", b("routed_latent_norm"), w("w_lat_up"), b("routed_partial"), H, LATENT)
-                proj(L + "wsh", b("normed"), w("wsh"), b("shared_partial"), 2 * sh_l, H)
-                land_situ(L + "shared_situ", b("shared_partial"), b("shared_act"), sh_l)
-                proj(L + "sh_down", b("shared_act"), w("sh_down"), b("shared_partial2"), H, sh_l)
-                closing = (L + "hidden", b("routed_partial"), b("shared_partial2"), 1)
-
         assert blocks == blocks_total
         mix_in("out.res", b("sw_out"), b("gamma_final"), blocks_total)
         if chunk:
@@ -1141,6 +1180,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             weight(n + "wfu", [mla_fused_l, H],
                    [seg(a + "q_a_proj.weight"), seg(a + "kv_a_proj_with_mqa.weight"),
                     seg(a + "g_proj.weight", rows=shard(inner_l))])
+            if mx:
+                mxfp8(n + "wfu")
             weight(n + "gamma_q_a", [Q_LORA], [seg(a + "q_a_layernorm.weight")])
             weight(n + "gamma_kv_a", [KV_LORA], [seg(a + "kv_a_layernorm.weight")])
             weight(n + "w_q_b", [Q_B, Q_LORA], [seg(a + "q_b_proj.weight")])
@@ -1159,6 +1200,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 weight(n + "wkda", [kfused, H],
                        qkvg + [seg(a + "b_proj.weight", rows=shard(hl)), seg(a + "f_a_proj.weight"),
                                seg(a + "f_a_proj.weight", rows=[0, WSM - hl - HEAD_DIM])])
+                if mx:
+                    mxfp8(n + "wkda")
             else:
                 weight(n + "wbig", [fused_l, H], qkvg)
                 weight(n + "wsm.b", [hl, H], [seg(a + "b_proj.weight", rows=shard(hl))])
@@ -1187,20 +1230,28 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                         seg(e + "shared_experts.gate_proj.weight", rows=shard(sh_l)),
                         seg(e + "shared_experts.up_proj.weight", rows=shard(sh_l))])
             else:
-                weight(n + "w_router", [experts, H], [seg(e + "gate.weight")])
-            weight(n + "bias", [experts], [seg(e + "gate.e_score_correction_bias")], "f32")
+                weight(n + "w_router", [EXPERTS, H], [seg(e + "gate.weight")])
+            weight(n + "bias", [EXPERTS], [seg(e + "gate.e_score_correction_bias")], "f32")
             carry(n + "rs", [1])
             once.call("fill_bf16", [buf(n + "rs"), i32(1), {"f32": 1.0}], 1)
-            if fused:
+            if chunk and mx:
+                weight(n + "w_lat_down", [LATENT, H], [seg(e + "routed_expert_down_proj.weight")])
+                mxfp8(n + "w_lat_down")
+                gate_up(n + "w_sh_gu", e + "shared_experts.gate_proj.weight", e + "shared_experts.up_proj.weight", sh_l)
+            elif chunk:
                 weight(n + "w_moe_front", [LATENT + 2 * sh_l, H],
                        [seg(e + "routed_expert_down_proj.weight"), seg(e + "shared_experts.gate_proj.weight"),
                         seg(e + "shared_experts.up_proj.weight")])
             elif not front:
                 weight(n + "w_lat_down", [LATENT, H], [seg(e + "routed_expert_down_proj.weight")])
             weight(n + "gamma_lat", [LATENT], [seg(e + "routed_expert_norm.weight")])
-            if not front and not fused:
+            if decode and not front:
                 gate_up(n + "wsh", e + "shared_experts.gate_proj.weight", e + "shared_experts.up_proj.weight", sh_l)
-            if fused:
+            if chunk and mx:
+                weight(n + "w_lat_up", [H, LATENT], [seg(e + "routed_expert_up_proj.weight")])
+                mxfp8(n + "w_lat_up")
+                weight(n + "sh_down", [H, sh_l], [seg(e + "shared_experts.down_proj.weight")])
+            elif chunk:
                 # [lat_up | shared down] by columns, made while the weights load
                 for name, t, k in (("w_lat_up", "routed_expert_up_proj", LATENT), ("sh_down", "shared_experts.down_proj", sh_l)):
                     weight(n + name, [H, k], [seg(e + t + ".weight")])
@@ -1259,7 +1310,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         programs["tp_init"] = kern_manifest.program(init, once=True)
     m = {
         "schema_version": kern_manifest.SCHEMA_VERSION,
-        "model": f"{CHECKPOINTS[experts]}/{end}l/ep{tp}" + (f"-tp{tp}" if tp > 1 else "")
+        "model": f"kimi-k3/{end}l/ep{tp}" + (f"-tp{tp}" if tp > 1 else "")
                  + ("-dcp" if decode else "-prefill"),
         "vars": {T: {"max": t_max, "axis": "rows"}, "seqs": {"max": seqs_max, "axis": "groups"},
                  **({ROWS: {"max": chunk_max, "axis": "ranks"}, CTX: {"max": max_ctx}} if chunk else {})},
@@ -1312,8 +1363,6 @@ def main():
                     help="the MLA cache: SGLang's fp8 (e4m3; D attends it with FlashInfer's Cake kernel, P lifts it to "
                          "bf16 for the expansion and has no absorbed short path) or bf16")
     ap.add_argument("--kda-state", choices=("bf16", "f32"), default="bf16", help="the KDA recurrent state's storage")
-    ap.add_argument("--experts", type=int, default=224, choices=sorted(CHECKPOINTS),
-                    help="the checkpoint's routed experts: 224 the pruned one, 896 the full model")
     ap.add_argument("--moe-variants", metavar="FC1,FC2",
                     help="the batched-GEMM variants of the MoE by name (default: the index's picks)")
     a = ap.parse_args()
@@ -1322,7 +1371,7 @@ def main():
     if not a.chunk and a.seqs > 64:
         ap.error("D absorbs on tensor cores for at most 64 rows (k3_mla_absorb_mma BMAX)")
     names = tuple(a.moe_variants.split(",")) if a.moe_variants else None
-    json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.experts, a.pack,
+    json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.pack,
                     a.peer_ar, a.mla_short, a.kv, a.mla_ours_from, a.window, a.kda_state),
               sys.stdout, indent=1)
     print()

@@ -8,8 +8,8 @@
 # nvcc/cuobjdump (NVCC_BIN, default /usr/local/cuda-13.1/bin). Four parts:
 #   sass  every D1 cubin: no stack, no local memory, no .MULTICAST in its SASS
 #   tp8   harness/k3 (kern's K3 kernel harness, copied from its tools/k3-harness)
-#         built with the TP8 rank's model constants (HEADS 12, EXPERTS 896; the
-#         build copy's ref.h patched) over the HEADS=12 / EXPERTS=896 / INNER=1536 variants
+#         built with the TP8 rank's model constants (HEADS 12; the build copy's ref.h
+#         patched) over the HEADS=12 / INNER=1536 variants and the router
 #   d1    harness/d1.cu: vup_gate at 12 heads, the DCP fixup / pack / combine
 #         over 8 simulated members, FlashInfer routing of a 112-expert slice (contiguous and every 8th)
 #         with kern's finalize
@@ -54,7 +54,7 @@ cubin() {
 }
 
 D1=(k3_conv_silu+HEADS=12 k3_kda_core+HEADS=12 k3_kda_out_gate+HEADS=12 k3_mla_vup_gate+HEADS=12
-    k3_mla_prep+INNER=1536+MLA_FUSED=3648 k3_dcp k3_router_argmax+EXPERTS=896)
+    k3_mla_prep+INNER=1536+MLA_FUSED=3648 k3_dcp k3_router_argmax)
 
 sass() {
   for k in "${D1[@]}"; do
@@ -73,10 +73,10 @@ tp8() {
   local h="$out/k3-harness-tp8"
   mkdir -p "$h"
   cp "$here/k3/harness.cu" "$h/"
-  sed -e 's/^  HEADS = 96,/  HEADS = 12,/' -e 's/^  EXPERTS = 224,/  EXPERTS = 896,/' \
+  sed -e 's/^  HEADS = 96,/  HEADS = 12,/' \
       -e 's/^static const long long REC_BYTES = 6291456LL;/static const long long REC_BYTES = (long long)HEADS * 128 * 128 * 4;/' \
       "$here/k3/ref.h" > "$h/ref.h"
-  [ "$(grep -c '^  HEADS = 12,\|^  EXPERTS = 896,\|REC_BYTES = (long long)HEADS' "$h/ref.h")" -eq 3 ] \
+  [ "$(grep -c '^  HEADS = 12,\|REC_BYTES = (long long)HEADS' "$h/ref.h")" -eq 2 ] \
     || { echo "ref.h no longer has the constants this patch rewrites" >&2; exit 2; }
   build "$h/harness.cu" "$h/harness"
   local run=(r "$h/harness" --reps "$reps")
@@ -87,7 +87,7 @@ tp8() {
     "${run[@]}" --kernel mla_prep --cubin "$(cubin k3_mla_prep+INNER=1536+MLA_FUSED=3648)" --B "$B"
     "${run[@]}" --kernel mla_prep --cubin "$(cubin k3_mla_prep+INNER=1536+MLA_FUSED=3648)" --B "$B" \
       --grid "$B,3,1" --block 512,1,1 --nmla 2 --layer 1
-    "${run[@]}" --kernel router_topk --cubin "$(cubin k3_router_argmax+EXPERTS=896)" --B "$B" --block 1024,1,1
+    "${run[@]}" --kernel router_topk --cubin "$(cubin k3_router_argmax)" --B "$B" --block 1024,1,1
   done
 }
 

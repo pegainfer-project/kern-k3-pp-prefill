@@ -31,7 +31,7 @@ tools that check them.
 ## Deploy
 
 Everything is pinned to kern
-[`3eeec90`](https://github.com/pegainfer-project/kern/tree/3eeec9044ba437e2818052a17895b8670a552cee)
+[`5d0910c`](https://github.com/pegainfer-project/kern/tree/5d0910c5e5beef5b1b204853ad65f3e1fe994777)
 (`step/Cargo.toml` pins the same commit). On GB300 (sm_103a):
 
 1. **kern.** Check out that commit and build `kern` and `kern-serve`
@@ -99,16 +99,6 @@ checked against FlashInfer's own planner by
 needle tasks 1.00. Details and the c96 point:
 [`loop/rounds/r1/E2E.md`](loop/rounds/r1/E2E.md).
 
-**Prefill against SGLang PP4 (2026-10-06).** The pruned checkpoint (224
-experts) at PP4, one chunk of 3999 tokens. Each stage fed SGLang's proxy
-tensors stays within the band two SGLang runs span when only their KV
-dtype differs, the head picks SGLang's token and top-5 order, and two runs
-are byte-identical. The stages, the SGLang capture plugin and the
-comparison are at commit
-[`3baa6ef`](https://github.com/pegainfer-project/kern-k3-pp-prefill/tree/3baa6ef)
-(`manifests/`, `stage/`, `validation/`), for kern
-[`b43bb5a`](https://github.com/pegainfer-project/kern/tree/b43bb5a680d6fc92f969a7881e1ceca98c301607).
-
 ## P: the packed prefill
 
 - `--pack N` (16) makes the prefill ragged: up to N sequences a call, back to
@@ -134,6 +124,16 @@ comparison are at commit
   path is the bf16 DSL kernel's; `--kv bf16` keeps it). The KDA recurrent
   state is stored bf16 (`--kda-state bf16`, the default) and computed f32
   in both recurrence kernels; `--kda-state f32` is the f32 line.
+- Under `--kv fp8` the P follows vLLM's InferenceX K3 prefill recipe: its
+  attention runs on e4m3 (q and the expanded k | v cast at scale 1 into the
+  FMHA's e4m3 builds, o bf16; `use_prefill_query_quantization`), and four
+  projections are MXFP8 (vLLM's online mxfp8 of `in_proj_qkvgfab`,
+  `fused_qkv_a_g_proj`, `routed_expert_down_proj`, `routed_expert_up_proj`):
+  KDA's q | k | v | g | wsm, MLA's q_a | kv_a | g, lat_down and lat_up. Their
+  bf16 weights are `source` tensors quantized while the weights load, the
+  activation is quantized per call (`source/k3_mxfp8.cu`), and cuBLASLt
+  multiplies over both block scales (`extern:cublaslt_mxfp8_tn`). Everything
+  else, the shared expert and o_proj included, stays bf16.
 - Every layer has its own KV or KDA state, so `kern cut` splits the
   whole-model manifest into stages that carry only their own layers'
   states. A stage hands the next one the hidden stream and the
@@ -144,8 +144,6 @@ comparison are at commit
   then FC2). A stage's raw experts are bound as `source` tensors and
   shuffled by the `derive` program while the weights load, so the
   checkpoint and its shuffled copy never share a GPU.
-- The pruned checkpoint (224 experts) generates too, routed by FlashInfer's
-  routing kernels, for runs on fewer GPUs.
 
 ## D: TP8 / EP8 / DCP8
 
@@ -201,11 +199,8 @@ kern verify d-vllm.json
   `--max-num-batched-tokens` at most the manifest's 64. The manifest has
   no prefill, so prompts longer than one token need a KV connector.
 
-Verifying a hosted manifest and running it under vLLM need kern
-[#55](https://github.com/pegainfer-project/kern/pull/55) (on
-[#54](https://github.com/pegainfer-project/kern/pull/54)), past the
-`3eeec90` the rest of this repository is pinned to. That PR's
-`docs/vllm.md` has the 4-layer TP8 / DCP8 run on two 4-GPU GB300 nodes.
+kern's `docs/vllm.md` has the 4-layer TP8 / DCP8 run on two 4-GPU GB300
+nodes.
 
 ## D inside SGLang
 

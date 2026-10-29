@@ -17,10 +17,10 @@ mkdir -p "$out"
 cd "$REPO"
 export KERN=$K3_KERN
 gen() { python3 scripts/gen_stage.py "$@"; }
-P="--chunk 8192 --experts 896 --pack 16"
+P="--chunk 8192 --pack 16"
 FC1=bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f
 FC2=bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
-D="--experts 896 --seqs 64 --moe-variants $FC1,$FC2"
+D="--seqs 64 --moe-variants $FC1,$FC2"
 
 gen --layers 93 $P > "$out/p-93.json"
 at=$(python3 -c "

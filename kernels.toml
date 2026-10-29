@@ -88,13 +88,8 @@ sha256 = "8145127fb97b8eeaf18c8cc0ede00ae06e224d0c951734c66f4128e3bef67a92"
 source = "source/k3_prefill.cu"
 
 [kernels."k3_prefill_glue"]
-sha256 = "1253149942a224a0642119d31aa6da72848e3f1e38692c99a5346501d1616b6f"
-source = "source/k3_prefill_glue.cu"
-
-[kernels."k3_prefill_glue+EXPERTS=896"]
 sha256 = "1bce46950b3ec4e36a1a923fb0dbf86b8509bb95b72056ff7b757da39f583353"
 source = "source/k3_prefill_glue.cu"
-defines = { EXPERTS = 896 }
 
 [kernels."k3_residual+LAND_BF16=1"]
 sha256 = "1bb60d2f33b04d70d6866b50d12a67340e33cf0f1c555c9da92494dd5c98f254"
@@ -102,13 +97,8 @@ source = "source/k3_residual.cu"
 defines = { LAND_BF16 = 1 }
 
 [kernels."k3_router_argmax"]
-sha256 = "f64dc087c64d4464b10e639c945284742e6af88b3a9682fbf38125b9bedc98f2"
-source = "source/k3_router_argmax.cu"
-
-[kernels."k3_router_argmax+EXPERTS=896"]
 sha256 = "d7f650788bec1a15b13004a9ef0d1bb8dc109866b3189d0b0658ff1bd9dfad29"
 source = "source/k3_router_argmax.cu"
-defines = { EXPERTS = 896 }
 
 [kernels."k3_weight_prep"]
 sha256 = "a874bd671bfeb90103a3a5330876e062b5583c752b88e1eadb4e84050c18bf02"
@@ -123,6 +113,16 @@ upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce
 sha256 = "6a471f0ff4f8ffae55e48e64c07001ee80fb5bee604269d4814106e9baa98955"
 prebuilt = "prebuilt/trtllm_fmha_dense_h192_v128.cubin"
 upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvBfloat16OBfloat16HQk192HV128SeparateQkvDenseVarSeqQ256Kv128PersistentContext.cubin"
+
+[kernels."trtllm_fmha_ctx_h192_v128_e4m3"]
+sha256 = "3118d62ee587d76638710a98c5d40a4a49d799578e088dfa045f3db8dcdc7afd"
+prebuilt = "prebuilt/trtllm_fmha_ctx_h192_v128_e4m3.cubin"
+upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvE4m3OBfloat16HQk192HV128SeparateQkvCausalVarSeqQ256Kv128PersistentContext.cubin"
+
+[kernels."trtllm_fmha_dense_h192_v128_e4m3"]
+sha256 = "42d1628971703b9dba7e93d393abc3c7306a37d8a556a2ca8966e12f09b52737"
+prebuilt = "prebuilt/trtllm_fmha_dense_h192_v128_e4m3.cubin"
+upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvE4m3OBfloat16HQk192HV128SeparateQkvDenseVarSeqQ256Kv128PersistentContext.cubin"
 
 [kernels."weight_prep"]
 sha256 = "040f51b01c421b9c69a2090034ff1bc4741e40c02f5ea52bd04a3e62e5c1af4d"
@@ -238,6 +238,15 @@ sha256 = "8b4a88ab8182727ddf73aa330e3a979513fe36823a5c92a8d5ce16d847bc45a1"
 source = "source/k3_span_gather.cu"
 defines = { K9_LD = 49408, PARTIAL_BF16 = 1 }
 
+[kernels."k3_span_gather+K9_LD=49408+KDA_STATE_BF16=1+PARTIAL_BF16=1"]
+sha256 = "efd9f1d1091899947763d8de18e9c23d093533246a579cfe13adcd35c741270d"
+source = "source/k3_span_gather.cu"
+defines = { K9_LD = 49408, KDA_STATE_BF16 = 1, PARTIAL_BF16 = 1 }
+
+[kernels."k3_mxfp8"]
+sha256 = "470158ca9dd81e26ef800d486ee10fe06b85724c6fde3e49f6bf7918e30ce0cb"
+source = "source/k3_mxfp8.cu"
+
 [kernels."k3_kda_rec+K12_LD=49408"]
 sha256 = "663253f41bd8eaaa4d586ddcedf826d7b3d06defc77f3b95c4cf235a830e81ad"
 source = "source/k3_kda_rec.cu"
@@ -289,7 +298,7 @@ source = "source/k3_gemm_f32.cu"
 defines = { BN = 32, CTA_KB = 100, SPLITS = 3 }
 
 [kernels."k3_mla_glue+KV_FP8=1"]
-sha256 = "0ba911a2012c8d5809d52b57f1b0661524c8075c25810735f2685bab17dfdee7"
+sha256 = "a16d706fed7ef7b1ef9d801a2907092fbcc5fb61b92f38c6c2b505259d4d3bb2"
 source = "source/k3_mla_glue.cu"
 defines = { KV_FP8 = 1 }
 

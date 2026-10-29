@@ -6,7 +6,9 @@ k3_mla_absorb_mma's Q_FP8 build). D, always under DCP, attends with FlashInfer's
 (source/flashinfer-cake-k3-mla), its splits planned by FlashInfer's planner at 148 SMs for a member's share of
 the capture context (scripts/cake_plan.py), and the exchange's CAKE build merges its splits with the members'.
 P lifts the pages to bf16 as it gathers them (k3_mla_glue.cu's KV_FP8 build): every call expands its context,
-no absorbed short path.
+no absorbed short path. Its attention runs on e4m3 as vLLM's FP8 prefill does (`use_prefill_query_quantization`):
+q and the expanded k | v cast at scale 1 into the FMHA's e4m3 builds, o bf16. Its KDA and MLA input
+projections, lat_down and lat_up are MXFP8 as vLLM's online mxfp8 makes them.
 """
 import math
 
@@ -16,6 +18,8 @@ from k3_common import B, HEADS, KV_A, KV_LORA, NOPE_DIM, ROPE, T, TP_TIMEOUT_NS,
 
 BYTES = 1
 P_GLUE = {"KV_FP8": 1}
+P_FP8_ATTN = True
+P_MXFP8 = True
 D_PREP = {"KV_FP8": 1}
 Q_ABS = "fp8e4m3"
 

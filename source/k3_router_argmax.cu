@@ -1,10 +1,10 @@
 // K6 -- router top-k + f32 argmax (kern K3 decode kernel set).
 //
-//   nvcc -cubin -arch=sm_103a -O3 -Xptxas -v [-DEXPERTS=896] \
+//   nvcc -cubin -arch=sm_103a -O3 -Xptxas -v \
 //        -o target/cubins/k3_router_argmax.cubin tools/kernels-src/k3_router_argmax.cu
 //
-// EXPERTS (default 224, the pruned checkpoint; 896 the full one) is a multiple
-// of 32; the router block is EXPERTS rounded up to 256 threads.
+// EXPERTS (896) is a multiple of 32; the router block is EXPERTS rounded up to
+// 256 threads.
 //
 // Entries (docs/k3-kernel-abi.md section K6):
 //
@@ -62,11 +62,11 @@
 #include <cuda_bf16.h>
 
 #ifndef EXPERTS
-#define EXPERTS 224
+#define EXPERTS 896
 #endif
 #define TOPK 16
 #define ROUTER_LANES 32
-#define ROUTER_PER_LANE (EXPERTS / ROUTER_LANES) /* 7 */
+#define ROUTER_PER_LANE (EXPERTS / ROUTER_LANES) /* 28 */
 #define ROUTER_THREADS ((EXPERTS + 255) / 256 * 256)
 // S's row stride: its own width, or a fused GEMM's whose first columns it is.
 #ifndef LDS
@@ -87,7 +87,7 @@ __device__ __forceinline__ float unord_f32(u32 o) {
 }
 
 // max over o[L, L + N) as a tree split at the largest power of two below N:
-// for N = 7 the ((0 1)(2 3))((4 5) 6) order the pruned build was tuned with.
+// for N = 7 the ((0 1)(2 3))((4 5) 6) order.
 template <int L, int N>
 __device__ __forceinline__ u32 tree_max(const u32 (&o)[ROUTER_PER_LANE]) {
   if constexpr (N == 1) {

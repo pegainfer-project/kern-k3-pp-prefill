@@ -487,7 +487,7 @@ extern "C" __global__ void __launch_bounds__(RTHREADS, 3) kern_k3g_land_add2_att
 
 // ---------------------------------------------------------------- K6
 #ifndef EXPERTS
-#define EXPERTS 224
+#define EXPERTS 896
 #endif
 #define TOPK 16
 #define TK_PER (EXPERTS / 32)

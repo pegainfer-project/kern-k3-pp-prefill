@@ -4,16 +4,15 @@
 around the glue of source/k3_moe_prefill.cu: the pieces gen_stage.py lays
 out. A fork of kern's tools/k3_moe_bmm.py.
 
-One rank holds `local` of the model's `experts` experts: every one (P, 224
-or 896 of them) or every `stride`-th one (a D member: 112 of 896, member r
-holding r, r + 8, ...). Its part of a layer: quantise the latent rows to
+One rank holds `local` of the model's 896 experts: every one (P) or every
+`stride`-th one (a D member: 112 of them, member r holding r, r + 8, ...). Its part of a layer: quantise the latent rows to
 mxfp8, build the routing tables of its experts, FC1 (gate | up, SiTU, mxfp8
 out), FC2 (bf16 out per permuted row), and the top-k combine into a bf16
 partial whose rows past `tokens` are zero. P routes in one call with the
-router top-k, the quant and the shared activation (source/k3_moe_route.cu)
-when its kernel takes the expert count; otherwise the tables come from
-FlashInfer's kernels (flashinfer_moe_routing_abi.py), the same up to the
-order of rows within an expert.
+router top-k, the quant and the shared activation (source/k3_moe_route.cu);
+a D member's tables come from FlashInfer's kernels
+(flashinfer_moe_routing_abi.py), the same up to the order of rows within an
+expert.
 The expert weights are the checkpoint's mxfp4 tensors row-shuffled once
 after load (`k3_moe_w_shuffle` / `k3_moe_sf_shuffle`, once.py): FC1's rows
 are [up; gate] before the shuffle, so the kernel's pair (x0, x1) is (up, gate)
@@ -24,6 +23,7 @@ import flashinfer_moe_routing_abi as flashinfer_moe_routing
 from kernels import index
 from kernels.abi import trtllm_bmm
 from pinned import module
+from k3_common import EXPERTS
 
 H, I, TOPK = 3584, 3072, 16
 ALPHA, BETA = 4.0, 25.0
@@ -52,13 +52,13 @@ def glue(entry, grid, block=256, mod=None):
     return {**(mod or index.variant(GLUE).module), "entry": entry, "grid": grid, "block": [block, 1, 1]}
 
 
-def pieces(local, experts, tokens, tokens_max, out_rows, prefix="", names=None, stride=None, pdl=False):
-    """The ops and workspace buffers for `local` of `experts` experts over `tokens` rows (a var, at most
+def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=None, pdl=False):
+    """The ops and workspace buffers for `local` of the experts over `tokens` rows (a var, at most
     `tokens_max`); the combine writes `out_rows` rows (an expression). `steps` lists the calls of one
     layer. `stride`: the rank holds experts `rank + j * stride` (D), else every expert (P)."""
     v1, v2 = variants(names)
     # The combine + latent norm (source/k3_prefill_glue.cu).
-    pglue = module(PGLUE, **({"EXPERTS": experts} if experts != 224 else {}))
+    pglue = module(PGLUE)
     tile = v1.tags["tile"][1]
     assert v2.tags["tile"][1] == tile, "both GEMMs read one set of CTA tables"
     ctas = trtllm_bmm.ctas_bound(tokens, TOPK, local, tile)
@@ -67,14 +67,14 @@ def pieces(local, experts, tokens, tokens_max, out_rows, prefix="", names=None, 
     n = lambda s: prefix + s
     i32 = lambda v: {"i32": v}
     dim = lambda x: {"var": x} if isinstance(x, str) else {"expr": x}
-    whole = local == experts
+    whole = local == EXPERTS
     # P routes in one call (route_step) and keeps no FlashInfer counts.
-    fused = stride is None and experts % 128 == 0
+    fused = stride is None
     assert not fused or tokens_max <= ROUTE_ROWS
-    sync_words = 66 + 2 * experts * (1 + ROUTE_ROWS // 256 + ROUTE_ROWS // 32)
+    sync_words = 66 + 2 * EXPERTS * (1 + ROUTE_ROWS // 256 + ROUTE_ROWS // 32)
     buffers = {
         **({n("route_sync"): {"dtype": "u32", "shape": [sync_words], "kind": "workspace"}} if fused else
-           {n("counts"): {"dtype": "i32", "shape": [flashinfer_moe_routing.counts_len(experts)], "kind": "workspace"}}),
+           {n("counts"): {"dtype": "i32", "shape": [flashinfer_moe_routing.counts_len(EXPERTS)], "kind": "workspace"}}),
         n("cta_batch"): {"dtype": "i32", "shape": [ctas_max], "kind": "workspace"},
         n("cta_limit"): {"dtype": "i32", "shape": [ctas_max], "kind": "workspace"},
         n("num_non_exiting"): {"dtype": "i32", "shape": [1], "kind": "workspace"},
@@ -90,7 +90,7 @@ def pieces(local, experts, tokens, tokens_max, out_rows, prefix="", names=None, 
             "params": ["in buffer<bf16>", "out buffer<u8>", "out buffer<u8>", "i32", "i32"],
             "impl": {"launches": [glue("kern_k3_moe_quant", [{"ceil_div": [{"mul": [tokens, H // 32]}, 256]}, 1, 1])]},
         },
-        **({} if fused else {"moe_routing": flashinfer_moe_routing.op(module(ROUTING), experts, tokens, tokens_max,
+        **({} if fused else {"moe_routing": flashinfer_moe_routing.op(module(ROUTING), EXPERTS, tokens, tokens_max,
                                                                       tile, local=local, stride=stride or 1)}),
         **({"moe_route": {
             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "in buffer<bf16>", "i32", "in buffer<bf16>",
@@ -99,7 +99,7 @@ def pieces(local, experts, tokens, tokens_max, out_rows, prefix="", names=None, 
                        "inout buffer<u32>",
                        *["out buffer<i32>"] * 6, "i32", "i32"],
             "impl": {"launches": [
-                {**module(ROUTE, **({"EXPERTS": experts} if experts != 896 else {})), "entry": "kern_k3g_moe_route",
+                {**module(ROUTE), "entry": "kern_k3g_moe_route",
                  "block": [32 * ROUTE_WARPS, 1, 1], **g}
                 for g in ({"grid": [ROUTE_BLOCKS_SMALL, 1, 1], "when": {"var": tokens, "max": 256}},
                           {"grid": [ROUTE_BLOCKS, 1, 1], "when": {"var": tokens, "min": 257}})]},

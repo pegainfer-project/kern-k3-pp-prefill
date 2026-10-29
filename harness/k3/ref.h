@@ -40,7 +40,7 @@ enum : int {
   MLA_FUSED = Q_LORA + KV_A + INNER,  // 14400
   KDA_FUSED = 4 * INNER,      // 49152
   WSM = 256,
-  EXPERTS = 224,
+  EXPERTS = 896,
   TOPK = 16,
   LATENT = 3584,
   INTER = 3072,

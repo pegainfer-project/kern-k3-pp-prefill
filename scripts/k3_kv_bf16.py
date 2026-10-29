@@ -15,6 +15,8 @@ from k3_common import (B, HEADS, KV_LORA, LATENT_ROW, MLA_SHORT_SPLITS, NOPE_DIM
 
 BYTES = 2
 P_GLUE = None
+P_FP8_ATTN = False
+P_MXFP8 = False
 D_PREP = {}
 Q_ABS = "bf16"
 

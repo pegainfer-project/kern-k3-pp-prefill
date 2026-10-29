@@ -33,6 +33,11 @@
 //     attention: out = bf16(bf16(acc_o / s) * bf16(sigmoid(bf16(partial[b, HEADC + j])))), out [B, n].
 //   grid (ceil(B / 8) * n / 2048 + the absorbed form's blocks, 1, 1)   block (256, 1, 1)
 //
+//   kern_k3g_e4m3(in, out, rows, width)   (KV_FP8 build)
+//     out = in's first rows x width bf16 as e4m3 bytes by aten's cast (k3_e4m3.cuh): the FMHA's fp8 q and
+//     expanded k | v, vLLM's `.to(float8_e4m3fn)` at scale 1. 8 elements a thread a pass, grid-stride.
+//   grid (any, 1, 1)   block (256, 1, 1)
+//
 // Every value is k3_mla_prep's and sigmoid_mul's bit for bit (the same landings, sums and roundings);
 // the attention's o is an f32 merge of bf16 pieces, bf16-landed once.
 #include <cuda_bf16.h>
@@ -496,3 +501,14 @@ extern "C" __global__ void __launch_bounds__(256) kern_k3g_mla_gate(
   if (blockIdx.x >= gate_blocks) return;
   gate_rows(out, acc_o, acc_ms, partial, n, B);
 }
+
+#ifdef KV_FP8
+extern "C" __global__ void __launch_bounds__(256) kern_k3g_e4m3(const bf16_t* __restrict__ in, kv_t* __restrict__ out,
+                                                               int rows, int width) {
+  const long long n8 = (long long)rows * width / 8;
+  for (long long i = blockIdx.x * 256ll + threadIdx.x; i < n8; i += gridDim.x * 256ll) {
+    const uint4 v = reinterpret_cast<const uint4*>(in)[i];
+    reinterpret_cast<uint2*>(out)[i] = make_uint2(fp8x2(v.x) | fp8x2(v.y) << 16, fp8x2(v.z) | fp8x2(v.w) << 16);
+  }
+}
+#endif

@@ -388,7 +388,7 @@ Not kept (`work/umma/k3_moe_front.twotile.cu`).
 - **A persistent MoE kernel** (FC1 -> FC2 per expert panel, the shared projection filling the drain).
   References: DeepGEMM's `sm100_fp8_fp4_mega_moe.cuh` (fp8 x fp4 tcgen05, FC1 + SiTU + FC2 in one
   persistent kernel, but built around EP dispatch / combine over symmetric buffers), and the kernel
-  index's `k3_mega_moe` (a K3 build of it, 224 experts only, r1-r16). Our layout (replicated batch, every
+  index's `k3_mega_moe` (a K3 build of it, not for the full 896 experts, r1-r16). Our layout (replicated batch, every
   rank its experts over every row, then the all-reduce) would need its dispatch removed and the routing
   tables built in it. What it could take back, from the waves above: FC1's and FC2's last-wave
   quantization (half a wave each, 2-3 us), the FC1 -> FC2 boundary, FC1's entry wait behind the tables
