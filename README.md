@@ -36,7 +36,10 @@ Everything is pinned to kern
 
 1. **kern.** Check out that commit and build `kern` and `kern-serve`
    (`cargo build --release -p kern-run -p kern-serve`; kern-serve needs
-   protoc and libssl-dev).
+   protoc and libssl-dev). The fp8 P's MXFP8 projections also need
+   `extern:cublaslt_mxfp8_tn`
+   ([kern#103](https://github.com/pegainfer-project/kern/pull/103)): run
+   the P on a kern that has it.
 2. **Manifests.**
 
    ```sh
@@ -134,6 +137,16 @@ comparison are at commit
   path is the bf16 DSL kernel's; `--kv bf16` keeps it). The KDA recurrent
   state is stored bf16 (`--kda-state bf16`, the default) and computed f32
   in both recurrence kernels; `--kda-state f32` is the f32 line.
+- Under `--kv fp8` the P follows vLLM's InferenceX K3 prefill recipe: its
+  attention runs on e4m3 (q and the expanded k | v cast at scale 1 into the
+  FMHA's e4m3 builds, o bf16; `use_prefill_query_quantization`), and four
+  projections are MXFP8 (vLLM's online mxfp8 of `in_proj_qkvgfab`,
+  `fused_qkv_a_g_proj`, `routed_expert_down_proj`, `routed_expert_up_proj`):
+  KDA's q | k | v | g | wsm, MLA's q_a | kv_a | g, lat_down and lat_up. Their
+  bf16 weights are `source` tensors quantized while the weights load, the
+  activation is quantized per call (`source/k3_mxfp8.cu`), and cuBLASLt
+  multiplies over both block scales (`extern:cublaslt_mxfp8_tn`). Everything
+  else, the shared expert and o_proj included, stays bf16.
 - Every layer has its own KV or KDA state, so `kern cut` splits the
   whole-model manifest into stages that carry only their own layers'
   states. A stage hands the next one the hidden stream and the
