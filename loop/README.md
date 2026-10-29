@@ -32,10 +32,11 @@ measured too.
 | P stage 0 | 316 (26.3/layer) | 132.00 ms/item |
 | D 16 layers | 395 (24.7/layer) | 4.562 ms/step |
 
-D check of `main` against its oracle: top-1 0.9176, relRMS median 1.77% /
-max 8.3%, one confident flip; that band comes from TP8 summing bf16 partials
-across ranks and merging DCP attention by LSE. Two runs of `main` are
-bit-identical.
+D check of `main` against its oracle: top-1 0.8949, relRMS median 4.1% / max
+16.8%, three confident flips; that band comes from fp8 pages and a bf16 KDA
+state against the oracle's bf16 pages and f32 state, and from TP8 summing
+bf16 partials across ranks and merging DCP attention by LSE. Two runs of
+`main` are bit-identical.
 
 ## GPUs
 
