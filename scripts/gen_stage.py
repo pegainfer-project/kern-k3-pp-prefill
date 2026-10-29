@@ -7,8 +7,8 @@ helpers, `once`, the kernel index, the FMHA and batched-GEMM ABI ports) are
 imported from the kern checkout KERN names:
 
     KERN=<kern checkout> KERN_INDEX_DIR=<kern master>/kernel_index \
-      python3 scripts/gen_stage.py --chunk 8192 --experts 896 --max-ctx 262144 > p.json
-    ... --tp 8 --experts 896 --max-ctx 327680 --moe-variants FC1,FC2 --peer-ar > d.json
+      python3 scripts/gen_stage.py --chunk 8192 --experts 896 > p.json
+    ... --tp 8 --experts 896 --moe-variants FC1,FC2 --peer-ar > d.json
 
 Both run layers [0, --layers) with the embedding and the head, and keep one
 state per layer (`kv.<i>`, `kda.<i>`), so `kern cut` can drop the layers a
@@ -1305,7 +1305,7 @@ def main():
                     help="D: batches of at least ROWS rows take k3_mla_decode.cu for the MLA attention (default: the DSL)")
     ap.add_argument("--peer-ar", action="store_true",
                     help="D: the sums by the Lamport one-shot over the group's peers instead of NCCL")
-    ap.add_argument("--max-ctx", type=int, default=16384)
+    ap.add_argument("--max-ctx", type=int, default=1 << 20, help="the longest context a sequence reaches")
     ap.add_argument("--window", type=int, default=65536,
                     help="P: the cached keys an MLA layer expands and attends in one round")
     ap.add_argument("--kv", choices=tuple(KV), default="fp8",

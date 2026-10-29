@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # scripts/deploy.sh <kern checkout> <kernel index> <out>: the manifests of a full-K3 P/D
 # deployment, each verified by the checkout's kern.
-#   <out>/p/stage{0..7}.json  P: the packed 93-layer prefill (16 sequences a chunk of 8192 rows,
-#                             262144 context) cut into PP8 stages every 12 layers
-#   <out>/d.json              D: the 93-layer TP8 / EP8 / DCP8 decode step (64 sequences,
-#                             327680 context)
+#   <out>/p/stage{0..7}.json  P: the packed 93-layer prefill (16 sequences a chunk of 8192 rows)
+#                             cut into PP8 stages every 12 layers
+#   <out>/d.json              D: the 93-layer TP8 / EP8 / DCP8 decode step (64 sequences)
+# Both at the generator's defaults: fp8 pages, a bf16 KDA state, 1M context.
 # The kern checkout is the commit step/Cargo.toml pins, built (`cargo build --release`); the kernel
 # index is kern master's kernel_index/.
 set -euo pipefail
@@ -17,7 +17,7 @@ FC2=bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x3
 gen() { python3 "$repo/scripts/gen_stage.py" "$@"; }
 
 mkdir -p "$out"
-gen --layers 93 --chunk 8192 --experts 896 --pack 16 --max-ctx 262144 > "$out/p-93.json"
+gen --layers 93 --chunk 8192 --experts 896 --pack 16 > "$out/p-93.json"
 at=$(python3 -c "
 import json, sys
 calls = json.load(open(sys.argv[1]))['programs']['prefill']['calls']
@@ -27,6 +27,6 @@ rm -rf "$out/p"
 "$bin" cut "$out/p-93.json" --at "$at" --out "$out/p"
 rm "$out/p-93.json"
 
-gen --layers 93 --tp 8 --experts 896 --max-ctx 327680 --seqs 64 \
+gen --layers 93 --tp 8 --experts 896 --seqs 64 \
   --moe-variants "$FC1,$FC2" --peer-ar > "$out/d.json"
 "$bin" verify "$out/d.json"
