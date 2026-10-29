@@ -31,15 +31,12 @@ tools that check them.
 ## Deploy
 
 Everything is pinned to kern
-[`3eeec90`](https://github.com/pegainfer-project/kern/tree/3eeec9044ba437e2818052a17895b8670a552cee)
+[`5d0910c`](https://github.com/pegainfer-project/kern/tree/5d0910c5e5beef5b1b204853ad65f3e1fe994777)
 (`step/Cargo.toml` pins the same commit). On GB300 (sm_103a):
 
 1. **kern.** Check out that commit and build `kern` and `kern-serve`
    (`cargo build --release -p kern-run -p kern-serve`; kern-serve needs
-   protoc and libssl-dev). The fp8 P's MXFP8 projections also need
-   `extern:cublaslt_mxfp8_tn`
-   ([kern#103](https://github.com/pegainfer-project/kern/pull/103)): run
-   the P on a kern that has it.
+   protoc and libssl-dev).
 2. **Manifests.**
 
    ```sh
@@ -202,11 +199,8 @@ kern verify d-vllm.json
   `--max-num-batched-tokens` at most the manifest's 64. The manifest has
   no prefill, so prompts longer than one token need a KV connector.
 
-Verifying a hosted manifest and running it under vLLM need kern
-[#55](https://github.com/pegainfer-project/kern/pull/55) (on
-[#54](https://github.com/pegainfer-project/kern/pull/54)), past the
-`3eeec90` the rest of this repository is pinned to. That PR's
-`docs/vllm.md` has the 4-layer TP8 / DCP8 run on two 4-GPU GB300 nodes.
+kern's `docs/vllm.md` has the 4-layer TP8 / DCP8 run on two 4-GPU GB300
+nodes.
 
 ## D inside SGLang
 

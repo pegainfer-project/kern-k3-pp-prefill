@@ -43,9 +43,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kern_manifest::types::{BufferKind, Dim};
+use kern_manifest::types::Dim;
 use kern_pool::Interleave;
-use kern_runtime::{Capacity, NcclId, PeerHandle, Runtime, Topology};
+use kern_runtime::{Capacity, Offer, Runtime, Topology};
 
 struct Args {
     manifest: PathBuf,
@@ -138,56 +138,19 @@ fn top2(row: &[f32]) -> [f64; 3] {
 }
 
 /// Rank 0 writes a fresh id; the others wait for it to appear.
-fn nccl_id(path: &Path, rank: u64) -> anyhow::Result<NcclId> {
-    if rank == 0 {
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, NcclId::new()?.to_bytes())?;
-        std::fs::rename(&tmp, path)?;
-    }
-    let t = Instant::now();
-    loop {
-        if let Ok(b) = std::fs::read(path) {
-            if let Ok(b) = <[u8; 128]>::try_from(b.as_slice()) {
-                return Ok(NcclId::from_bytes(b));
-            }
-        }
-        anyhow::ensure!(t.elapsed() < Duration::from_secs(3600), "no nccl id at {} after an hour", path.display());
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-/// Every member's handles of the buffers its peers map, through files beside the NCCL id.
-fn handles(path: &Path, rank: u64, world: u64, own: &BTreeMap<String, PeerHandle>) -> anyhow::Result<Vec<BTreeMap<String, PeerHandle>>> {
-    let file = |r: u64| path.with_extension(format!("h{r}"));
-    let mut bytes = Vec::new();
-    for (n, h) in own {
-        let h = h.to_bytes().ok_or_else(|| anyhow::anyhow!("`{n}` has no fabric handle to share"))?;
-        bytes.extend((n.len() as u32).to_le_bytes());
-        bytes.extend(n.as_bytes());
-        bytes.extend(h);
-    }
-    let tmp = path.with_extension(format!("h{rank}-tmp"));
-    std::fs::write(&tmp, &bytes)?;
+/// Every member's offer (its manifest's digest, its handles, member 0's NCCL id), through files beside `path`.
+fn offers(path: &Path, rank: u64, world: u64, own: &Offer) -> anyhow::Result<Vec<Offer>> {
+    let file = |r: u64| path.with_extension(format!("o{r}"));
+    let tmp = path.with_extension(format!("o{rank}-tmp"));
+    std::fs::write(&tmp, own.to_bytes()?)?;
     std::fs::rename(&tmp, file(rank))?;
-    let parse = |b: &[u8]| -> Option<BTreeMap<String, PeerHandle>> {
-        let mut out = BTreeMap::new();
-        let mut at = 0;
-        while at < b.len() {
-            let n = u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?) as usize;
-            let name = String::from_utf8(b.get(at + 4..at + 4 + n)?.to_vec()).ok()?;
-            let h = PeerHandle::from_bytes(b.get(at + 4 + n..at + 4 + n + PeerHandle::BYTES)?)?;
-            out.insert(name, h);
-            at += 4 + n + PeerHandle::BYTES;
-        }
-        Some(out)
-    };
     let t = Instant::now();
     (0..world)
         .map(|r| loop {
-            if let Some(h) = std::fs::read(file(r)).ok().and_then(|b| parse(&b)).filter(|h| h.len() == own.len()) {
-                return Ok(h);
+            if let Some(o) = std::fs::read(file(r)).ok().and_then(|b| Offer::from_bytes(&b).ok()) {
+                return Ok(o);
             }
-            anyhow::ensure!(t.elapsed() < Duration::from_secs(600), "no handles from rank {r}");
+            anyhow::ensure!(t.elapsed() < Duration::from_secs(3600), "no offer from rank {r} after an hour");
             std::thread::sleep(Duration::from_millis(200));
         })
         .collect()
@@ -222,21 +185,14 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let topo = Topology::one("tp", a.rank, a.world);
     // every row's local positions, plus the pad's page
-    let capacity = Capacity { tokens: Some(((local + 64) * (b + 1)) as u64), seqs: (b + 1) as u64, landings: 0 };
+    let capacity = Capacity { tokens: Some(((local + 64) * (b + 1)) as u64), slots: (b + 1) as u64, landings: 0 };
     let mut rt = Runtime::load(&m, None, a.gpu, Some(capacity), Some(&topo))?;
     rt.set_eager(!a.graph && !benching);
     rt.load_weights(&kern_runtime::Safetensors::open(&[&a.weights])?)?;
     if a.world > 1 {
         let path = a.nccl_id.as_ref().ok_or_else(|| anyhow::anyhow!("--world > 1 needs --nccl-id"))?;
-        rt.join_nccl("tp", &nccl_id(path, a.rank)?)?;
-        let mapped: Vec<&str> =
-            m.buffers.values().filter(|b| b.kind == BufferKind::Peer).filter_map(|b| b.of.as_deref()).collect();
-        if !mapped.is_empty() {
-            let own: BTreeMap<String, PeerHandle> =
-                rt.export_handles()?.into_iter().filter(|(n, _)| mapped.contains(&n.as_str())).collect();
-            let members = handles(path, a.rank, a.world, &own)?;
-            rt.import_peers("tp", &members)?;
-        }
+        let members = offers(path, a.rank, a.world, &rt.offer()?)?;
+        rt.connect(&BTreeMap::from([("tp".to_string(), members)]))?;
     }
     let once = BTreeMap::from([("tokens".to_string(), 1u64), ("seqs".to_string(), 1)]);
     for (name, p) in &m.programs {
