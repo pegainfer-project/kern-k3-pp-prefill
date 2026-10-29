@@ -17,7 +17,7 @@ FC2=bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x3
 gen() { python3 "$repo/scripts/gen_stage.py" "$@"; }
 
 mkdir -p "$out"
-gen --layers 93 --chunk 8192 --experts 896 --pack 16 > "$out/p-93.json"
+gen --layers 93 --chunk 8192 --pack 16 > "$out/p-93.json"
 at=$(python3 -c "
 import json, sys
 calls = json.load(open(sys.argv[1]))['programs']['prefill']['calls']
@@ -27,6 +27,6 @@ rm -rf "$out/p"
 "$bin" cut "$out/p-93.json" --at "$at" --out "$out/p"
 rm "$out/p-93.json"
 
-gen --layers 93 --tp 8 --experts 896 --seqs 64 \
+gen --layers 93 --tp 8 --seqs 64 \
   --moe-variants "$FC1,$FC2" --peer-ar > "$out/d.json"
 "$bin" verify "$out/d.json"

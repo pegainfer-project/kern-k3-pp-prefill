@@ -102,16 +102,6 @@ checked against FlashInfer's own planner by
 needle tasks 1.00. Details and the c96 point:
 [`loop/rounds/r1/E2E.md`](loop/rounds/r1/E2E.md).
 
-**Prefill against SGLang PP4 (2026-10-06).** The pruned checkpoint (224
-experts) at PP4, one chunk of 3999 tokens. Each stage fed SGLang's proxy
-tensors stays within the band two SGLang runs span when only their KV
-dtype differs, the head picks SGLang's token and top-5 order, and two runs
-are byte-identical. The stages, the SGLang capture plugin and the
-comparison are at commit
-[`3baa6ef`](https://github.com/pegainfer-project/kern-k3-pp-prefill/tree/3baa6ef)
-(`manifests/`, `stage/`, `validation/`), for kern
-[`b43bb5a`](https://github.com/pegainfer-project/kern/tree/b43bb5a680d6fc92f969a7881e1ceca98c301607).
-
 ## P: the packed prefill
 
 - `--pack N` (16) makes the prefill ragged: up to N sequences a call, back to
@@ -157,8 +147,6 @@ comparison are at commit
   then FC2). A stage's raw experts are bound as `source` tensors and
   shuffled by the `derive` program while the weights load, so the
   checkpoint and its shuffled copy never share a GPU.
-- The pruned checkpoint (224 experts) generates too, routed by FlashInfer's
-  routing kernels, for runs on fewer GPUs.
 
 ## D: TP8 / EP8 / DCP8
 

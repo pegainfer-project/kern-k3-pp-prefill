@@ -88,13 +88,8 @@ sha256 = "8145127fb97b8eeaf18c8cc0ede00ae06e224d0c951734c66f4128e3bef67a92"
 source = "source/k3_prefill.cu"
 
 [kernels."k3_prefill_glue"]
-sha256 = "1253149942a224a0642119d31aa6da72848e3f1e38692c99a5346501d1616b6f"
-source = "source/k3_prefill_glue.cu"
-
-[kernels."k3_prefill_glue+EXPERTS=896"]
 sha256 = "1bce46950b3ec4e36a1a923fb0dbf86b8509bb95b72056ff7b757da39f583353"
 source = "source/k3_prefill_glue.cu"
-defines = { EXPERTS = 896 }
 
 [kernels."k3_residual+LAND_BF16=1"]
 sha256 = "1bb60d2f33b04d70d6866b50d12a67340e33cf0f1c555c9da92494dd5c98f254"
@@ -102,13 +97,8 @@ source = "source/k3_residual.cu"
 defines = { LAND_BF16 = 1 }
 
 [kernels."k3_router_argmax"]
-sha256 = "f64dc087c64d4464b10e639c945284742e6af88b3a9682fbf38125b9bedc98f2"
-source = "source/k3_router_argmax.cu"
-
-[kernels."k3_router_argmax+EXPERTS=896"]
 sha256 = "d7f650788bec1a15b13004a9ef0d1bb8dc109866b3189d0b0658ff1bd9dfad29"
 source = "source/k3_router_argmax.cu"
-defines = { EXPERTS = 896 }
 
 [kernels."k3_weight_prep"]
 sha256 = "a874bd671bfeb90103a3a5330876e062b5583c752b88e1eadb4e84050c18bf02"

@@ -16,8 +16,7 @@ KV_EXP = HEADS * trtllm_fmha_abi.KV_ROW  # 30720, k 192 | v 128 per head
 Q_B = HEADS * 192                  # 18432
 WSM = 256                          # b_proj 96 | f_a 128 | pad
 TOPK, LATENT, INTER = 16, 3584, 3072
-# The checkpoint by its expert count: the pruned dev one, the full model.
-CHECKPOINTS = {224: "kimi-k3-pruned-75pct", 896: "kimi-k3"}
+EXPERTS = 896                      # routed
 SHARED = 2 * INTER                 # 6144
 DENSE_I = 33792
 ATTN_RES_BLOCK = 12
