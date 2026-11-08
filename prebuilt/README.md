@@ -11,6 +11,7 @@ bytes as well.
 | `trtllm_fmha_dense_h192_v128.cubin` | the same bundle: its dense (non-causal) sibling, for P's rounds over the cached context | `LICENSE.trtllm-gen.txt` |
 | `trtllm_fmha_{ctx,dense}_h192_v128_e4m3.cubin` | the same bundle: both with e4m3 Q / K / V and a bf16 O, the kernels FlashInfer's ragged prefill takes for FP8 queries | `LICENSE.trtllm-gen.txt` |
 | `flash_kda_d128_varlen.cubin` | the vendored FlashKDA in `../source/flash-kda/` built with `KERN_DEFINES=-DKERN_VARLEN` (upstream's varlen instantiation, for the packed prefill) | MIT, see that directory |
+| `mla_decode_h96_p64.cubin` | FlashInfer's CuTe-DSL MLA decode compiled for K3's bf16 D by `../source/flashinfer-mla-dsl/build.py` | BSD-3-Clause, see that directory and its `PROVENANCE.md` |
 | `flashinfer_moe_routing.cubin` | built from `../source/flashinfer-moe-routing/` | Apache-2.0, see that directory and its `PROVENANCE.md` |
 
 No source recipe is available here for the TRT-LLM gen cubins.

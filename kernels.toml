@@ -74,6 +74,16 @@ sha256 = "ed18f10e6aaa61fdd32f130cc703dfd3e70be828abe28848ce3e256eeac14953"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, KV_FP8 = 1, MLA_FUSED = 3648 }
 
+[kernels."mla_decode_h96_p64"]
+sha256 = "791c7796dc32caad4688270b1524ea756542d3dec7e13b3bee433f8bdfafcbf4"
+prebuilt = "prebuilt/mla_decode_h96_p64.cubin"
+build = "source/flashinfer-mla-dsl/build.py"
+upstream = "FlashInfer 0.6.x, flashinfer/cute_dsl/attention/monolithic/mla_decode_fp16.py, CuTe DSL 4.6.0 (BSD-3-Clause)"
+
+[kernels."k3_mla_vup_gate"]
+sha256 = "df2c0f73251e6d87c8eeb5291efab13c4e8b640e81ae938c27cd37de489ffab0"
+source = "source/k3_mla_vup_gate.cu"
+
 [kernels."k3_mla_vup_gate+HEADS=12"]
 sha256 = "a6b673b9fa7595089c49b403cdf23c8d0224bab53b0b9224fc6392afe87c09c6"
 source = "source/k3_mla_vup_gate.cu"

@@ -26,6 +26,7 @@ tools that check them.
 | [`harness/`](harness/) | kernel acceptance runs and the error-budget study |
 | [`decode/sglang-tp8-dcp8-ep8/`](decode/sglang-tp8-dcp8-ep8/) | SGLang's full-K3 decode CUDA graphs at TP8 / DCP8 / EP8, captured launch by launch: the reference D's layout follows |
 | [`loop/`](loop/) | the overnight kernel loop that optimizes P and D, its rounds and results |
+| [`docs/`](docs/) | the kernel set's contract ([`k3-kernel-abi.md`](docs/k3-kernel-abi.md)), the DCP microbench ([`dcp-bench.md`](docs/dcp-bench.md)) and the EP communication survey ([`moe-comm-survey.md`](docs/moe-comm-survey.md)) behind this deployment |
 | [`roofline/`](roofline/) | every kernel of P's stage 0 and of the D step at production shapes against a floor from measured ceilings: [prefill](roofline/prefill.md), [decode](roofline/decode.md) |
 
 ## Deploy
