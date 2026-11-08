@@ -49,7 +49,7 @@ def variants(names=None):
 
 
 def glue(entry, grid, block=256, mod=None):
-    return {**(mod or index.variant(GLUE).module), "entry": entry, "grid": grid, "block": [block, 1, 1]}
+    return {**(mod or module(GLUE)), "entry": entry, "grid": grid, "block": [block, 1, 1]}
 
 
 def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=None, pdl=False):
