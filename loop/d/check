@@ -3,10 +3,10 @@
 # d-l4-tp8.json) teacher-forced over 4 rows x 640 steps of real text, every
 # 64th step's logits kept, judged against main's band.
 #
-# main's own TP8 run is not the oracle's: TP8 sums bf16 partials across
-# ranks and merges DCP attention by LSE, the one-GPU oracle does neither, so
-# main sits at top-1 0.918, relRMS median 1.77% / max 8.3%, one confident
-# flip. A candidate passes when it is no worse than that band (top-1 within
+# main's own TP8 run is not the oracle's: TP8 keeps fp8 pages and a bf16
+# KDA state, sums bf16 partials across ranks and merges DCP attention by LSE,
+# the one-GPU oracle (bf16 pages, f32 state) does none of it, so main sits at
+# top-1 0.895, relRMS median 4.1% / max 16.8%, three confident flips. A candidate passes when it is no worse than that band (top-1 within
 # 1 point, median relRMS within 25%, max within 2 points, at most one more
 # confident flip, all ranks identical). Its distance from main itself is
 # printed too: that is the error the change introduced, to be explained.

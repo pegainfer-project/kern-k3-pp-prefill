@@ -81,7 +81,7 @@ Main's numbers (measured on this pool; do not re-measure; `$K3_LOOP_DATA/base/` 
 | P launches | 16.7/layer after round 1 (27.1 at its start); ~122-124 ms/item |
 | D 16 layers, weighted | 3.486 ms/step after round 1 (4.562 at its start) |
 | D launches | 207 per step, 12.9/layer after round 1 (395 at its start) |
-| D check | top-1 0.9176 · relRMS median 0.0177 max 0.0829 · 1 confident flip, vs the oracle; bit-identical run to run |
+| D check | top-1 0.8949 · relRMS median 0.0412 max 0.1684 · 3 confident flips, vs the oracle; bit-identical run to run |
 
 `$K3_LOOP_DATA/base/` holds main's manifests and reports (`p-bench.json`,
 `d-bench/`), for `loop/score` or per-op shares (`p-bench.json` has
